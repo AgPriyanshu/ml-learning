@@ -1,0 +1,68 @@
+📦 Problem Statement: Gadget Recognition and Specification Extraction from Product Images
+🛒 Background:
+
+E-commerce platforms often host thousands of gadget listings (phones, laptops, smartwatches, etc.). Automating the process of recognizing gadgets and extracting their specs from images can help in cataloging, price comparison, and recommendation systems.
+🎯 Objective:
+
+Build a deep learning model that can:
+
+    Classify gadget type (e.g., smartphone, laptop, tablet, smartwatch).
+
+    Optionally extract model or specs from image or associated OCR text (RAM, storage, brand, model).
+
+🧾 Dataset:
+
+You can create or gather data from:
+
+    Kaggle Datasets:
+
+        Mobile and Tablet Images Dataset (for mobile/laptop categories)
+
+        Gadgets Product Image Dataset (variety of electronics)
+
+    DuckDuckGo Image Scraping: Use tools like duckduckgo_search Python package or browser extension to collect images of labeled gadgets.
+
+🧪 Tasks:
+Task 1: Gadget Classification
+
+    Use a CNN or pre-trained model (like MobileNet, EfficientNet) to classify an image into categories like:
+
+        Mobile Phone
+
+        Laptop
+
+        Tablet
+
+        Smartwatch
+
+        Earbuds / Headphones
+
+Task 2 (Optional): Specification Extraction
+
+    Use OCR (like Tesseract) on product images with text overlays or labels.
+
+    Apply NER (Named Entity Recognition) using a model like spaCy or BERT to extract structured data like:
+
+        Brand
+
+        Model
+
+        RAM/Storage
+
+        Screen Size
+
+        Price
+
+🧠 Model Ideas:
+
+    For classification: Fine-tune a CNN backbone (ResNet18, EfficientNetB0, etc.).
+
+    For OCR + spec extraction: Use pytesseract + custom regex/NER pipeline.
+
+💡 Stretch Goals:
+
+    Build a small search engine: Input an image of a gadget, and the app returns matching gadgets from your dataset.
+
+    Create a price predictor using metadata extracted from the image and public gadget pricing data.
+
+Would you like a basic project scaffold or a notebook to start this?
