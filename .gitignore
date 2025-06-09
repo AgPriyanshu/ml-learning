@@ -157,3 +157,5 @@ test
 kaggle.json
 data
 datasets
+
+wandb
