@@ -159,3 +159,7 @@ data
 datasets
 
 wandb
+
+
+# Model weights
+*.pth
