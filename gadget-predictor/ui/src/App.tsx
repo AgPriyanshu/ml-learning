@@ -22,7 +22,7 @@ function App() {
     const topDevice = devices[randomIndex];
 
     // Generate realistic confidence scores
-    const predictions: Prediction[] = devices.map((device, index) => {
+    const predictions: Prediction[] = devices.map((device) => {
       let confidence: number;
       if (device === topDevice) {
         confidence = 0.75 + Math.random() * 0.24; // 75-99%

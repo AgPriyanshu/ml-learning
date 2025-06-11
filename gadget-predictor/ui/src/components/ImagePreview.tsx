@@ -1,5 +1,5 @@
-import React from 'react';
-import { X } from 'lucide-react';
+import React from "react";
+import { X } from "lucide-react";
 
 interface ImagePreviewProps {
   imageUrl: string;
@@ -7,7 +7,11 @@ interface ImagePreviewProps {
   onRemove: () => void;
 }
 
-export default function ImagePreview({ imageUrl, fileName, onRemove }: ImagePreviewProps) {
+export default function ImagePreview({
+  imageUrl,
+  fileName,
+  onRemove,
+}: ImagePreviewProps) {
   return (
     <div className="relative max-w-md mx-auto">
       <div className="relative bg-white rounded-2xl shadow-lg overflow-hidden">
