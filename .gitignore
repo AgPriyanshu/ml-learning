@@ -163,3 +163,4 @@ wandb
 
 # Model weights
 *.pth
+models
