@@ -1,0 +1,42 @@
+# Deep Learning and FastAI
+fastai>=2.7.0
+torch>=1.13.0
+torchvision>=0.14.0
+
+# Data Processing
+pandas>=1.5.0
+numpy>=1.21.0
+Pillow>=9.0.0
+opencv-python>=4.5.0
+scikit-image>=0.19.0
+
+# MLOps and Experiment Tracking
+wandb>=0.13.0
+mlflow>=2.0.0
+dvc>=2.0.0
+
+# API and Deployment
+fastapi>=0.95.0
+uvicorn>=0.20.0
+pydantic>=1.10.0
+python-multipart>=0.0.5
+
+# Data Validation and Quality
+great-expectations>=0.15.0
+pydantic>=1.10.0
+
+# Monitoring and Logging
+prometheus-client>=0.15.0
+loguru>=0.6.0
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+# Containerization
+docker>=6.0.0
+
+# Utilities
+python-dotenv>=0.19.0
+click>=8.0.0
+tqdm>=4.64.0 

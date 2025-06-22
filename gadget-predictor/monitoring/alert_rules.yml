@@ -1,0 +1,60 @@
+groups:
+  - name: model_performance
+    rules:
+      - alert: ModelAccuracyDropped
+        expr: model_accuracy < 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Model accuracy has dropped below 80%"
+          description: "Model accuracy is {{ $value }}, which is below the acceptable threshold of 0.8"
+
+      - alert: HighPredictionLatency
+        expr: histogram_quantile(0.95, model_prediction_duration_seconds_bucket) > 1.0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High prediction latency detected"
+          description: "95th percentile prediction latency is {{ $value }}s"
+
+      - alert: ModelServiceDown
+        expr: up{job="gadget-predictor"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Model service is down"
+          description: "The gadget predictor service has been down for more than 1 minute"
+
+  - name: data_drift
+    rules:
+      - alert: DataDriftDetected
+        expr: data_drift_score > 0.7
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Data drift detected"
+          description: "Data drift score is {{ $value }}, indicating potential model degradation"
+
+  - name: system_resources
+    rules:
+      - alert: HighMemoryUsage
+        expr: (container_memory_usage_bytes / container_spec_memory_limit_bytes) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage"
+          description: "Memory usage is above 90%"
+
+      - alert: HighCPUUsage
+        expr: rate(container_cpu_usage_seconds_total[5m]) * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage"
+          description: "CPU usage is above 80%"
