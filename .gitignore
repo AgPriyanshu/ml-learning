@@ -146,6 +146,7 @@ notebook/templates/*.html
 .pixi
 *.egg-info
 
+.venv
 virtual-env
 *.jpg
 
