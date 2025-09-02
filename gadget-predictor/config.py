@@ -5,7 +5,7 @@ Configuration file for the MLOps pipeline
 import os
 from pathlib import Path
 from typing import List, Dict, Any
-from pydantic import BaseSettings, validator
+from pydantic.functional_validators import field_validator
 
 
 class Config(BaseSettings):
@@ -102,7 +102,7 @@ class Config(BaseSettings):
         env_file = ".env"
         case_sensitive = True
 
-    @validator("MODEL_DIR", "LOGS_DIR", pre=True, always=True)
+    @field_validator("MODEL_DIR", "LOGS_DIR", pre=True, always=True)
     def create_directories(cls, v):
         """Create directories if they don't exist"""
         if isinstance(v, str):

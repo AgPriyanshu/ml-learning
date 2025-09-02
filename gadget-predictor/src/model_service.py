@@ -13,7 +13,7 @@ import uvicorn
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, field_validator
 from PIL import Image
 import prometheus_client
 from prometheus_client import Counter, Histogram, Gauge
@@ -55,7 +55,7 @@ class PredictionRequest(BaseModel):
     image_url: Optional[str] = None
     confidence_threshold: Optional[float] = 0.5
 
-    @validator("confidence_threshold")
+    @field_validator("confidence_threshold")
     def validate_confidence(cls, v):
         if not 0.0 <= v <= 1.0:
             raise ValueError("Confidence threshold must be between 0 and 1")
