@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 from pathlib import Path
+import random
 import tempfile
 import time
 from typing import Tuple, List, Dict, Optional
@@ -15,114 +16,63 @@ from torch.amp import autocast, GradScaler
 
 import rasterio
 from rasterio.windows import Window
-from segmentation_models_pytorch import Unet
+from rasterio.env import Env
+from segmentation_models_pytorch import DeepLabV3Plus
+from utils import (
+    compute_grid,
+    get_file_profile,
+    normalize01_then_standardize,
+    pad_to_square,
+    read_mask_tile,
+    read_mask_tile_scaled,
+    read_rgb_tile,
+    read_rgb_tile_scaled,
+)
 from mlflow_helpers import MlflowLogger, get_system_metrics
-from constants import DATASET_DIR, ORTHO_FILE_PATH
+from constants import DATASET_DIR, IMAGENET_MEAN, IMAGENET_STD, ORTHO_FILE_PATH
 from tqdm.auto import tqdm
+import torch.nn.functional as F
 
 # ---------------------------- #
 # ---------- CONFIG ---------- #
 # ---------------------------- #
+import torch, os
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
+try:
+    import torch.multiprocessing as mp
 
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass  # already set
+
+
+# modest but safe defaults for GDAL (tune up if RAM allows)
+# os.environ["GDAL_CACHEMAX"] = os.environ.get("GDAL_CACHEMAX", "1024")  # MB
+# os.environ["GDAL_NUM_THREADS"] = os.environ.get("GDAL_NUM_THREADS", "ALL_CPUS")
+
+# Speed up cuDNN autotuning for fixed image sizes
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("medium")  # Ampere+
 
 # ---------------------------- #
 # ---------- UTILS ----------- #
 # ---------------------------- #
 
 
-def open_profile_like(ref_tif: Path) -> dict:
-    with rasterio.open(ref_tif) as ref:
-        return ref.profile.copy()
-
-
-def compute_grid(H: int, W: int, tile_size: int, overlap: int) -> List[Tuple[int, int]]:
-    step = tile_size - overlap
-    xs = list(range(0, W, step))
-    ys = list(range(0, H, step))
-    if xs[-1] + tile_size < W:
-        xs.append(W - tile_size)
-    if ys[-1] + tile_size < H:
-        ys.append(H - tile_size)
-    return [(y, x) for y in ys for x in xs]
-
-
-def read_rgb_tile(
-    ds: rasterio.io.DatasetReader, x0: int, y0: int, T: int, W: int, H: int
-) -> Tuple[np.ndarray, Tuple[int, int]]:
-    x1, y1 = min(x0 + T, W), min(y0 + T, H)
-    win = Window(x0, y0, x1 - x0, y1 - y0)
-    tile = ds.read(indexes=[1, 2, 3], window=win).astype(np.float32)  # (3,h,w)
-    return tile, (x1 - x0, y1 - y0)
-
-
-def read_mask_tile(
-    ds: rasterio.io.DatasetReader, x0: int, y0: int, T: int, W: int, H: int
-) -> Tuple[np.ndarray, Tuple[int, int]]:
-    x1, y1 = min(x0 + T, W), min(y0 + T, H)
-    win = Window(x0, y0, x1 - x0, y1 - y0)
-    m = ds.read(1, window=win)
-    return m, (x1 - x0, y1 - y0)
-
-
-def normalize01_then_standardize(
-    arr: np.ndarray, mean=IMAGENET_MEAN, std=IMAGENET_STD
-) -> np.ndarray:
-    if arr.max() > 1.5:
-        arr = arr / 255.0
-    mean = np.array(mean, np.float32)[:, None, None]
-    std = np.array(std, np.float32)[:, None, None]
-    return (arr - mean) / std
-
-
-def pad_to_square(tile: np.ndarray, T: int) -> np.ndarray:
-    ph, pw = T - tile.shape[1], T - tile.shape[2]
-    if ph > 0 or pw > 0:
-        tile = np.pad(tile, ((0, 0), (0, ph), (0, pw)), mode="reflect")
-    return tile
-
-
-def write_geotiff_single_band(
-    array: np.ndarray, out_path: Path, profile: dict, dtype: str
-):
-    p = profile.copy()
-    p.update(
-        driver="GTiff",
-        dtype=dtype,
-        count=1,
-        compress="deflate",
-        predictor=2 if "float" in dtype else 1,
-        tiled=True,
-        blockxsize=256,
-        blockysize=256,
-        BIGTIFF="IF_SAFER",
-    )
-    with rasterio.open(out_path, "w", **p) as dst:
-        dst.write(array.astype(dtype), 1)
-
-
-def dice_coeff(
-    pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6
-) -> torch.Tensor:
+def dice_coeff(pred, target, eps: float = 1e-6):
     pred = pred.view(pred.size(0), -1)
     target = target.view(target.size(0), -1)
     inter = (pred * target).sum(dim=1)
     union = pred.sum(dim=1) + target.sum(dim=1)
-    dice = (2 * inter + eps) / (union + eps)
-    return dice.mean()
+    return ((2 * inter + eps) / (union + eps)).mean()
 
 
-def iou_score(
-    pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6
-) -> torch.Tensor:
+def iou_score(pred, target, eps: float = 1e-6):
     pred = pred.view(pred.size(0), -1)
     target = target.view(target.size(0), -1)
     inter = (pred * target).sum(dim=1)
     union = pred.sum(dim=1) + target.sum(dim=1) - inter
-    iou = (inter + eps) / (union + eps)
-    return iou.mean()
+    return ((inter + eps) / (union + eps)).mean()
 
 
 def cosine_with_warmup(total_steps: int, warmup_steps: int = 1000):
@@ -143,8 +93,6 @@ def cosine_with_warmup(total_steps: int, warmup_steps: int = 1000):
 
 
 class OrthoTileDataset(Dataset):
-    """Tiled RGB reader for a single ortho TIFF (inference)."""
-
     def __init__(
         self,
         tif_path,
@@ -170,7 +118,7 @@ class OrthoTileDataset(Dataset):
     def __getitem__(self, idx):
         y0, x0 = self.coords[idx]
         with rasterio.open(self.tif_path) as ds:
-            rgb, (w, h) = read_rgb_tile(ds, x0, y0, self.T, self.W, self.H)  # (3,h,w)
+            rgb, (w, h) = read_rgb_tile(ds, x0, y0, self.T, self.W, self.H)
         rgb = normalize01_then_standardize(rgb, self.mean, self.std)
         rgb = pad_to_square(rgb, self.T)
         meta = {"y0": y0, "x0": x0, "h": h, "w": w}
@@ -204,6 +152,7 @@ class RasterPairTileDataset(Dataset):
         mean=IMAGENET_MEAN,
         std=IMAGENET_STD,
         reject_empty: bool = True,
+        train_scales: tuple[int, ...] = (1, 2, 4),
     ):
         self.img_path = str(image_tif_path)
         self.lbl_path = str(label_tif_path)
@@ -211,6 +160,7 @@ class RasterPairTileDataset(Dataset):
         self.overlap = int(overlap)
         self.mean, self.std = mean, std
         self.reject_empty = reject_empty
+        self.train_scales = tuple(sorted(set(train_scales)))
 
         with rasterio.open(self.img_path) as ds:
             self.H, self.W = ds.height, ds.width
@@ -220,18 +170,14 @@ class RasterPairTileDataset(Dataset):
             if ds.height != self.H or ds.width != self.W:
                 raise ValueError("Image and label rasters must match in size.")
 
-        # Build initial full grid
         all_coords = compute_grid(self.H, self.W, self.T, self.overlap)
 
-        # Optionally filter out tiles that are fully background (no label==1)
         if self.reject_empty:
             keep_coords = []
             with rasterio.open(self.lbl_path) as dl:
                 for y0, x0 in all_coords:
                     lab, (w, h) = read_mask_tile(dl, x0, y0, self.T, self.W, self.H)
-                    if (
-                        lab == 1
-                    ).any():  # keep only tiles with at least one positive pixel
+                    if (lab == 1).any():
                         keep_coords.append((y0, x0))
             if len(keep_coords) == 0:
                 raise RuntimeError(
@@ -239,8 +185,8 @@ class RasterPairTileDataset(Dataset):
                 )
             self.coords = keep_coords
             print(
-                f"[RasterPairTileDataset] Kept {len(self.coords)} tiles with positives "
-                f"(rejected {len(all_coords) - len(self.coords)} empty tiles)."
+                f"[RasterPairTileDataset] Kept {len(self.coords)} positive tiles "
+                f"(rejected {len(all_coords)-len(self.coords)} empty)."
             )
         else:
             self.coords = all_coords
@@ -250,39 +196,79 @@ class RasterPairTileDataset(Dataset):
 
     def __getitem__(self, idx):
         y0, x0 = self.coords[idx]
+        scale = random.choice(self.train_scales)
+
         with rasterio.open(self.img_path) as di, rasterio.open(self.lbl_path) as dl:
-            rgb, (w, h) = read_rgb_tile(di, x0, y0, self.T, self.W, self.H)
-            lab, _ = read_mask_tile(dl, x0, y0, self.T, self.W, self.H)
-
-        rgb = normalize01_then_standardize(rgb, self.mean, self.std)
-        rgb = pad_to_square(rgb, self.T)
-
-        # label (H,W) -> (1,H,W), binarize 1, ignore 255
-        lab = lab.astype(np.int32)
-        ignore = lab == 255
-        lab = (lab == 1).astype(np.float32)
-
-        # pad to T×T with constant 0 for label & ignore
-        ph, pw = self.T - lab.shape[0], self.T - lab.shape[1]
-        if ph > 0 or pw > 0:
-            lab = np.pad(lab, ((0, ph), (0, pw)), mode="constant", constant_values=0)
-            ignore = np.pad(
-                ignore, ((0, ph), (0, pw)), mode="constant", constant_values=False
+            rgb_s, (w, h) = read_rgb_tile_scaled(
+                di, x0, y0, self.T, self.W, self.H, scale
             )
+            lab_s, _ = read_mask_tile_scaled(dl, x0, y0, self.T, self.W, self.H, scale)
+
+        # Normalize on the scaled data, then upsample to T×T
+        rgb_s = normalize01_then_standardize(rgb_s, self.mean, self.std)  # (3,hs,ws)
+        rgb_t = torch.from_numpy(rgb_s).unsqueeze(0)  # (1,3,hs,ws)
+        rgb_t = F.interpolate(
+            rgb_t, size=(self.T, self.T), mode="bilinear", align_corners=False
+        ).squeeze(0)
+
+        # Labels: binarize before upsample, keep ignore==255 with nearest
+        lab = lab_s.astype(np.int32)
+        ignore = lab == 255
+        lab_bin = (lab == 1).astype(np.float32)  # (hs,ws)
+
+        lab_t = torch.from_numpy(lab_bin).unsqueeze(0).unsqueeze(0)  # (1,1,hs,ws)
+        lab_t = F.interpolate(lab_t, size=(self.T, self.T), mode="nearest").squeeze(
+            0
+        )  # (1,T,T)
+
+        ign_t = torch.from_numpy(~ignore).unsqueeze(0).unsqueeze(0)
+        ign_t = (
+            F.interpolate(ign_t.float(), size=(self.T, self.T), mode="nearest")
+            .bool()
+            .squeeze(0)
+        )  # (1,T,T)
 
         sample = {
-            "image": torch.from_numpy(rgb),  # (3,T,T)
-            "target": torch.from_numpy(lab[None]),  # (1,T,T)
-            "ignore": torch.from_numpy(~ignore[None]),  # keep-mask True=use pixel
+            "image": rgb_t.contiguous(),  # (3,T,T)
+            "target": lab_t.contiguous(),  # (1,T,T)
+            "ignore": ign_t.contiguous(),  # (1,T,T) True=keep
         }
         return sample
 
 
 def collate_pairs(batch):
     imgs = torch.stack([b["image"] for b in batch], dim=0)
-    targs = torch.stack([b["target"] for b in batch], dim=0)
+    tars = torch.stack([b["target"] for b in batch], dim=0)
     keep = torch.stack([b["ignore"] for b in batch], dim=0)
-    return imgs, targs, keep
+    return imgs, tars, keep
+
+
+# --------------------------------- #
+# ---------- EMA helper ----------- #
+# --------------------------------- #
+
+
+class EMA:
+    """Exponential Moving Average of model weights (eval-time smoothing)."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {
+            k: v.detach().clone()
+            for k, v in model.state_dict().items()
+            if v.dtype.is_floating_point
+        }
+
+    def update(self, model: nn.Module):
+        with torch.no_grad():
+            for k, v in model.state_dict().items():
+                if k in self.shadow and v.dtype.is_floating_point:
+                    self.shadow[k].mul_(self.decay).add_(
+                        v.detach(), alpha=1.0 - self.decay
+                    )
+
+    def apply_to(self, model: nn.Module):
+        model.load_state_dict({**model.state_dict(), **self.shadow}, strict=False)
 
 
 # --------------------------------- #
@@ -293,15 +279,22 @@ def collate_pairs(batch):
 class Trainer:
     def __init__(
         self,
-        encoder_name="resnet34",
-        encoder_weights="imagenet",
         tile_size=1024,
         overlap=512,
-        batch_size=8,
+        batch_size=2,
         threshold=0.45,
         lr=3e-4,
         weight_decay=1e-2,
         device: Optional[str] = None,
+        encoder_name: str = "resnet50",
+        encoder_weights: str = "imagenet",
+        backbone_lr_mult: float = 0.5,  # smaller LR for encoder
+        freeze_encoder_epochs: int = 1,  # warmup: freeze encoder N epochs
+        use_ema: bool = True,
+        ema_decay: float = 0.999,
+        grad_accum_steps: int = 1,
+        grad_clip_norm: float = 1.0,
+        compile_model: bool = False,  # torch.compile for extra speed
     ):
         self.tile_size = tile_size
         self.overlap = overlap
@@ -311,44 +304,69 @@ class Trainer:
         self.weight_decay = weight_decay
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.model = Unet(
-            encoder_name=encoder_name,
-            encoder_weights=encoder_weights,
-            in_channels=3,
-            classes=1,
-        ).to(self.device)
+        self.model = (
+            DeepLabV3Plus(
+                encoder_name=encoder_name,
+                encoder_weights=encoder_weights,
+                in_channels=3,
+                classes=1,
+            )
+            .to(self.device)
+            .to(memory_format=torch.channels_last)
+        )
+
+        # Store train knobs
+        self.backbone_lr_mult = backbone_lr_mult
+        self.freeze_encoder_epochs = max(0, int(freeze_encoder_epochs))
+        self.grad_accum_steps = max(1, int(grad_accum_steps))
+        self.grad_clip_norm = grad_clip_norm
+
+        # EMA
+        self.use_ema = use_ema
+        self.ema = EMA(self.model, ema_decay) if use_ema else None
+
+        # (Optional) compile
+        if compile_model and torch.cuda.is_available() and torch.__version__ >= "2.1":
+            try:
+                self.model = torch.compile(self.model)
+            except Exception:
+                pass  # fall back silently
 
     def _make_loss(self, pos_weight: float = 2.0):
         bce = nn.BCEWithLogitsLoss(
             pos_weight=torch.tensor(pos_weight, device=self.device)
         )
 
-        def dice_loss_from_logits(logits, target, keep_mask):
-            probs = torch.sigmoid(logits)
-            probs = probs[keep_mask]
-            t = target[keep_mask]
-            inter = (probs * t).sum()
-            dice = 1 - (2 * inter + 1.0) / ((probs + t).sum() + 1.0)
-            return dice
-
         def criterion(logits, target, keep_mask):
+            # logits, target: (B,1,H,W); keep_mask: (B,1,H,W) True=use
             if keep_mask is not None:
-                logits = logits.masked_select(keep_mask)
-                target = target.masked_select(keep_mask)
+                logits = logits[keep_mask]
+                target = target[keep_mask]
             loss_bce = bce(logits, target)
-            loss_dice = dice_loss_from_logits(
-                logits.view(-1, 1, 1, 1),
-                target.view(-1, 1, 1, 1),
-                torch.ones_like(target, dtype=torch.bool, device=target.device),
-            )
+            probs = torch.sigmoid(logits)
+            inter = (probs * target).sum()
+            denom = probs.sum() + target.sum()
+            loss_dice = 1.0 - (2.0 * inter + 1.0) / (denom + 1.0)
             return 0.5 * loss_bce + 0.5 * loss_dice
 
         return criterion
 
     def _make_optimizer(self):
-        return AdamW(
-            self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay
-        )
+        # param groups: smaller LR for encoder, larger for decoder/seghead
+        enc_params = list(self.model.encoder.parameters())
+        dec_params = [
+            p for n, p in self.model.named_parameters() if not n.startswith("encoder.")
+        ]
+        param_groups = [
+            {"params": enc_params, "lr": self.lr * self.backbone_lr_mult},
+            {"params": dec_params, "lr": self.lr},
+        ]
+        try:
+            return AdamW(
+                param_groups, lr=self.lr, weight_decay=self.weight_decay, fused=True
+            )
+        except TypeError:
+            return AdamW(param_groups, lr=self.lr, weight_decay=self.weight_decay)
 
     def load_checkpoint(
         self,
@@ -359,33 +377,32 @@ class Trainer:
         ckpt_path = Path(ckpt_path)
         device = self.device if map_location is None else map_location
         ckpt = torch.load(ckpt_path, map_location=device)
-        state = ckpt.get("model", ckpt)  # support plain state_dict too
+        state = ckpt.get("model", ckpt)
         missing, unexpected = self.model.load_state_dict(state, strict=strict)
         if missing:
             print(f"[load_checkpoint] Missing keys: {missing}")
         if unexpected:
             print(f"[load_checkpoint] Unexpected keys: {unexpected}")
-        print(f"[load_checkpoint] Loaded weights from: {ckpt_path}")
-        # Optional: record metadata if present
+        print(f"[load_checkpoint] Loaded: {ckpt_path}")
         self.start_epoch = int(ckpt.get("epoch", 0)) + 1
         self.best_val = float(ckpt.get("val_dice", float("nan")))
-        self.model.eval()  # set eval for inference
+        self.model.eval()
 
     def train(
         self,
         image_tif_path: Path,
         label_tif_path: Path,
-        epochs: int = 60,
+        epochs: int,
         val_split: float = 0.1,
         pos_weight: float = 2.0,
         num_workers: int = 2,
         ckpt_dir: Path | str = "ckpts",
         amp: bool = True,
         reject_empty: bool = True,
-        experiment: str = "Footprints-UNet",
+        experiment: str = "Footprints-DeepLabV3Plus",
         run_name: str | None = None,
+        early_stop_patience: int = 10,
     ):
-
         ckpt_dir = Path(ckpt_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -397,6 +414,7 @@ class Trainer:
             mean=IMAGENET_MEAN,
             std=IMAGENET_STD,
             reject_empty=reject_empty,
+            train_scales=(1, 2, 4),
         )
 
         n_total = len(dataset)
@@ -406,45 +424,53 @@ class Trainer:
             dataset, [n_train, n_val], generator=torch.Generator().manual_seed(42)
         )
 
+        # High-throughput DataLoaders
         train_loader = DataLoader(
             train_ds,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=num_workers,
             pin_memory=True,
+            persistent_workers=(num_workers > 0),
+            prefetch_factor=2 if num_workers > 0 else None,
             collate_fn=collate_pairs,
+            drop_last=True,
         )
         val_loader = DataLoader(
             val_ds,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=num_workers,
+            num_workers=max(1, num_workers // 2),
             pin_memory=True,
+            persistent_workers=(num_workers > 0),
+            prefetch_factor=2 if num_workers > 0 else None,
             collate_fn=collate_pairs,
         )
 
         criterion = self._make_loss(pos_weight=pos_weight)
         optim = self._make_optimizer()
-        total_steps = epochs * max(1, len(train_loader))
-        scheduler = LambdaLR(optim, cosine_with_warmup(total_steps, warmup_steps=1000))
-        scaler = GradScaler("cuda")
+        total_steps = max(1, epochs * len(train_loader))
+        scheduler = LambdaLR(
+            optim,
+            cosine_with_warmup(total_steps, warmup_steps=min(1000, total_steps // 10)),
+        )
+        scaler = GradScaler(enabled=(amp and self.device == "cuda"))
 
         best_val = -1.0
+        bad_epochs = 0
 
-        # === MLflow start ===
+        # Optionally freeze encoder for warmup epochs
+        if self.freeze_encoder_epochs > 0:
+            for p in self.model.encoder.parameters():
+                p.requires_grad = False
+
         with MlflowLogger(experiment=experiment, run_name=run_name) as mlf:
-            # Log static params once
             mlf.log_params(
-                encoder_name=(
-                    self.model.encoder_name
-                    if hasattr(self.model, "encoder_name")
-                    else "resnet34"
-                ),
-                encoder_weights="imagenet",
                 tile_size=self.tile_size,
                 overlap=self.overlap,
                 batch_size=self.batch_size,
                 lr=self.lr,
+                backbone_lr_mult=self.backbone_lr_mult,
                 weight_decay=self.weight_decay,
                 epochs=epochs,
                 pos_weight=pos_weight,
@@ -452,15 +478,22 @@ class Trainer:
                 amp=amp,
                 reject_empty=reject_empty,
                 device=self.device,
+                freeze_encoder_epochs=self.freeze_encoder_epochs,
+                grad_accum_steps=self.grad_accum_steps,
+                grad_clip_norm=self.grad_clip_norm,
+                use_ema=self.use_ema,
             )
 
+            global_step = 0
             for ep in range(1, epochs + 1):
-                # ---- Train ----
-                self.model.train()
-                loss_sum = 0.0
-                n_imgs = 0
-                t_start = time.time()
+                # Unfreeze encoder after warmup
+                if ep == (self.freeze_encoder_epochs + 1):
+                    for p in self.model.encoder.parameters():
+                        p.requires_grad = True
 
+                self.model.train()
+                loss_sum, n_imgs = 0.0, 0
+                t_start = time.time()
                 train_bar = tqdm(
                     train_loader,
                     desc=f"Epoch {ep}/{epochs} [train]",
@@ -468,31 +501,48 @@ class Trainer:
                     leave=False,
                 )
 
-                for batch_idx, (imgs, targs, keep) in enumerate(train_bar, start=1):
-                    imgs = imgs.to(self.device, non_blocking=True)
+                optim.zero_grad(set_to_none=True)
+                for bidx, (imgs, targs, keep) in enumerate(train_bar, start=1):
+                    imgs = imgs.to(self.device, non_blocking=True).to(
+                        memory_format=torch.channels_last
+                    )
                     targs = targs.to(self.device, non_blocking=True)
                     keep = keep.to(self.device, non_blocking=True).bool()
                     n_imgs += imgs.size(0)
 
-                    optim.zero_grad(set_to_none=True)
-                    with autocast("cuda"):
+                    with autocast(
+                        device_type="cuda", enabled=(amp and self.device == "cuda")
+                    ):
                         logits = self.model(imgs)
-                        loss = criterion(logits, targs, keep)
+                        loss = criterion(logits, targs, keep) / self.grad_accum_steps
 
                     scaler.scale(loss).backward()
-                    scaler.step(optim)
-                    scaler.update()
-                    scheduler.step()
 
-                    loss_sum += loss.item()
+                    # Gradient accumulation
+                    if (bidx % self.grad_accum_steps) == 0:
+                        if self.grad_clip_norm is not None and self.grad_clip_norm > 0:
+                            scaler.unscale_(optim)
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), self.grad_clip_norm
+                            )
+                        scaler.step(optim)
+                        scaler.update()
+                        optim.zero_grad(set_to_none=True)
+                        scheduler.step()
+
+                        # EMA update after optimizer step
+                        if self.use_ema:
+                            self.ema.update(self.model)
+
+                    loss_sum += loss.item() * self.grad_accum_steps
+                    global_step += 1
+
                     cur_lr = optim.param_groups[0]["lr"]
                     elapsed = max(1e-6, time.time() - t_start)
                     ips = n_imgs / elapsed
-
-                    # live progress
                     train_bar.set_postfix(
                         {
-                            "loss": f"{(loss_sum/batch_idx):.4f}",
+                            "loss": f"{(loss_sum/bidx):.4f}",
                             "lr": f"{cur_lr:.2e}",
                             "ips": f"{ips:.2f}",
                         }
@@ -500,8 +550,25 @@ class Trainer:
 
                 train_loss = loss_sum / max(1, len(train_loader))
 
-                # ---- Validate ----
+                # ---- Validate (use EMA weights if enabled) ----
                 self.model.eval()
+                eval_model = self.model
+                if self.use_ema:
+                    # temp swap: copy EMA weights into a shadow model for eval
+                    eval_model = (
+                        DeepLabV3Plus(
+                            encoder_name="resnet50",
+                            encoder_weights=None,
+                            in_channels=3,
+                            classes=1,
+                        )
+                        .to(self.device)
+                        .to(memory_format=torch.channels_last)
+                    )
+                    eval_model.load_state_dict(self.model.state_dict(), strict=False)
+                    self.ema.apply_to(eval_model)
+                    eval_model.eval()
+
                 dices, ious = [], []
                 val_bar = tqdm(
                     val_loader,
@@ -509,24 +576,25 @@ class Trainer:
                     unit="batch",
                     leave=False,
                 )
-                with torch.no_grad(), autocast("cuda"):
+                with torch.inference_mode(), autocast(
+                    device_type="cuda", enabled=(amp and self.device == "cuda")
+                ):
                     for imgs, targs, keep in val_bar:
-                        imgs = imgs.to(self.device, non_blocking=True)
+                        imgs = imgs.to(self.device, non_blocking=True).to(
+                            memory_format=torch.channels_last
+                        )
                         targs = targs.to(self.device, non_blocking=True)
                         keep = keep.to(self.device, non_blocking=True).bool()
 
-                        logits = self.model(imgs)
+                        logits = eval_model(imgs)
                         probs = torch.sigmoid(logits)
-                        probs_eval = probs * keep
+                        preds_bin = (probs >= 0.5).float() * keep
                         targs_eval = targs * keep
-                        preds_bin = (probs_eval >= 0.5).float()
 
                         d = dice_coeff(preds_bin, targs_eval).item()
                         i = iou_score(preds_bin, targs_eval).item()
                         dices.append(d)
                         ious.append(i)
-
-                        # show running val metrics
                         val_bar.set_postfix(
                             {
                                 "dice": f"{np.mean(dices):.4f}",
@@ -539,7 +607,7 @@ class Trainer:
                 secs = max(1e-6, time.time() - t_start)
                 ips_epoch = n_imgs / secs
 
-                # ---- Log metrics to MLflow ----
+                # Log metrics
                 sysm = get_system_metrics(self.device)
                 mlf.log_metrics(
                     {
@@ -553,19 +621,27 @@ class Trainer:
                     step=ep,
                 )
 
-                # Clear one-line bars and print a concise epoch summary
                 tqdm.write(
                     f"Epoch {ep:03d}/{epochs} | train_loss={train_loss:.4f} | "
                     f"val_dice={val_dice:.4f} | val_iou={val_iou:.4f} | ips={ips_epoch:.2f}"
                 )
 
-                # ---- Checkpoint (local only; not logged to MLflow) ----
-                if val_dice > best_val:
+                # Checkpoint
+                improved = val_dice > best_val
+                if improved:
                     best_val = val_dice
-                    ckpt_path = Path(ckpt_dir) / "unet_best.pt"
+                    bad_epochs = 0
+                    ckpt_path = Path(ckpt_dir) / "deeplabv3p_best_overviews.pt"
+                    to_save = self.model.state_dict()
+                    if self.use_ema:
+                        # Save EMA weights (often better at inference)
+                        ema_copy = {k: v.clone() for k, v in self.ema.shadow.items()}
+                        for k, v in ema_copy.items():
+                            if k in to_save:
+                                to_save[k] = v
                     torch.save(
                         {
-                            "model": self.model.state_dict(),
+                            "model": to_save,
                             "epoch": ep,
                             "val_dice": val_dice,
                             "val_iou": val_iou,
@@ -575,82 +651,26 @@ class Trainer:
                     tqdm.write(
                         f"  ✔ Saved best checkpoint -> {ckpt_path} (val_dice {val_dice:.4f})"
                     )
+                else:
+                    bad_epochs += 1
+                    if bad_epochs >= early_stop_patience:
+                        tqdm.write(
+                            f"Early stopping at epoch {ep} (no improvement for {bad_epochs} epochs)."
+                        )
+                        break
 
         return best_val
-
-    def predict(
-        self,
-        tif_path: Path,
-        out_dir: Path | str = "out_small",
-        num_workers: int = 6,
-        amp: bool = True,
-    ):
-        tif_path = Path(tif_path)
-        out_dir = Path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        dataset = OrthoTileDataset(
-            tif_path,
-            tile_size=self.tile_size,
-            overlap=self.overlap,
-            mean=IMAGENET_MEAN,
-            std=IMAGENET_STD,
-        )
-        loader = DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            collate_fn=collate_tiles,
-        )
-
-        H, W = dataset.H, dataset.W
-        prob_acc = np.zeros((H, W), dtype=np.float32)
-        cnt_acc = np.zeros((H, W), dtype=np.uint16)
-
-        self.model.eval()
-        with torch.no_grad(), autocast("cuda"):
-            for tiles, metas in loader:
-                tiles = tiles.to(self.device, non_blocking=True)  # (B,3,T,T)
-                logits = self.model(tiles)  # (B,1,T,T)
-                probs = (
-                    torch.sigmoid(logits).squeeze(1).float().cpu().numpy()
-                )  # (B,T,T)
-                for p, m in zip(probs, metas):
-                    y0, x0, h, w = (
-                        int(m["y0"]),
-                        int(m["x0"]),
-                        int(m["h"]),
-                        int(m["w"]),
-                    )
-                    prob_acc[y0 : y0 + h, x0 : x0 + w] += p[:h, :w]
-                    cnt_acc[y0 : y0 + h, x0 : x0 + w] += 1
-
-        prob = np.zeros_like(prob_acc, dtype=np.float32)
-        mask = cnt_acc > 0
-        prob[mask] = prob_acc[mask] / cnt_acc[mask]
-
-        profile = open_profile_like(tif_path)
-        prob_path = out_dir / f"{tif_path.stem}_prob.tif"
-        mask_path = out_dir / f"{tif_path.stem}_mask.tif"
-
-        write_geotiff_single_band(prob, prob_path, profile, "float32")
-        binary = (prob >= self.threshold).astype(np.uint8)
-        write_geotiff_single_band(binary, mask_path, profile, "uint8")
-
-        print(f"Saved:\n  Prob: {prob_path}\n  Mask: {mask_path}")
-        return str(prob_path), str(mask_path)
 
     def predict_streaming(
         self,
         tif_path: Path,
         out_dir: Path | str = "out_stream",
-        num_workers: int = 8,
+        num_workers: int = 2,
         amp: bool = True,
         blocksize: int = 1024,
         tmp_dir: str | None = None,
         show_bar: bool = True,
+        predict_scales: tuple[int, ...] = (1, 2),  # << NEW
     ):
         """
         Streaming prediction for huge orthos (e.g., 40 GB) with O(tiles) memory.
@@ -684,7 +704,7 @@ class Trainer:
         total_tiles = len(dataset)
 
         # Reference profile
-        ref_profile = open_profile_like(tif_path)
+        ref_profile = get_file_profile(tif_path)
 
         # Create temp folder
         tmp_dir = tmp_dir or tempfile.mkdtemp(prefix="footprints_tmp_")
@@ -744,21 +764,60 @@ class Trainer:
         )
 
         # Pass 1: accumulate per tile into SUM/COUNT rasters on disk
+        # Open base once to avoid re-opening per tile
+        base_ds = rasterio.open(tif_path)
+
         with torch.no_grad(), autocast("cuda"):
             for tiles, metas in iterator:
-                tiles = tiles.to(self.device, non_blocking=True).to(
-                    memory_format=torch.channels_last
-                )
-                logits = self.model(tiles)
+                # We will ignore 'tiles' (full-res) and read per-scale directly from base_ds
+                B = len(metas)
+                ms_logits_sum = None  # will be torch tensor (B,1,T,T)
+
+                for scale in predict_scales:
+                    # Build a batch at this scale by reading windows with out_shape
+                    batch_list = []
+                    for m in metas:
+                        y0, x0, h, w = (
+                            int(m["y0"]),
+                            int(m["x0"]),
+                            int(m["h"]),
+                            int(m["w"]),
+                        )
+                        # scaled read (3,hs,ws)
+                        rgb_s, _ = read_rgb_tile_scaled(
+                            base_ds, x0, y0, self.T, dataset.W, dataset.H, scale
+                        )
+                        rgb_s = normalize01_then_standardize(
+                            rgb_s, IMAGENET_MEAN, IMAGENET_STD
+                        )
+                        t = torch.from_numpy(rgb_s).unsqueeze(0)  # (1,3,hs,ws)
+                        t = F.interpolate(
+                            t,
+                            size=(self.tile_size, self.tile_size),
+                            mode="bilinear",
+                            align_corners=False,
+                        ).squeeze(0)
+                        batch_list.append(t)
+                    batch = torch.stack(batch_list, dim=0).to(
+                        self.device, non_blocking=True
+                    )  # (B,3,T,T)
+                    batch = batch.to(memory_format=torch.channels_last)
+
+                    logits = self.model(batch)  # (B,1,T,T)
+                    ms_logits_sum = (
+                        logits if ms_logits_sum is None else (ms_logits_sum + logits)
+                    )
+
+                # Average across scales, then to probs (CPU) for accumulation
+                logits_avg = ms_logits_sum / float(len(predict_scales))
                 probs = (
-                    torch.sigmoid(logits).squeeze(1).float().cpu().numpy()
+                    torch.sigmoid(logits_avg).squeeze(1).float().cpu().numpy()
                 )  # (B,T,T)
 
                 # Update SUM/COUNT windows
                 with rasterio.open(
                     sum_tif, "r+", sharing=False
                 ) as sum_ds, rasterio.open(cnt_tif, "r+", sharing=False) as cnt_ds:
-
                     for p, m in zip(probs, metas):
                         y0, x0, h, w = (
                             int(m["y0"]),
@@ -767,30 +826,24 @@ class Trainer:
                             int(m["w"]),
                         )
                         win = Window(x0, y0, w, h)
-
-                        # read->modify->write small windows
                         cur_sum = sum_ds.read(1, window=win)
                         cur_cnt = cnt_ds.read(1, window=win)
-
                         cur_sum += p[:h, :w].astype(np.float32)
-                        cur_cnt += 1  # uint16 is fine unless overlap is extreme
-
+                        cur_cnt += 1
                         sum_ds.write(cur_sum, 1, window=win)
                         cnt_ds.write(cur_cnt, 1, window=win)
 
                 processed += len(metas)
                 if show_bar:
                     elapsed = max(1e-6, time.time() - t0)
-                    tiles_per_sec = processed / elapsed
-                    # Estimate coverage quickly from count blocks (optional extra read avoided)
                     iterator.set_postfix(
                         {
                             "tiles": f"{processed}/{total_tiles}",
-                            "t/s": f"{tiles_per_sec:.2f}",
+                            "t/s": f"{processed/elapsed:.2f}",
                         }
                     )
 
-        # Pass 2: stream SUM/COUNT -> PROB and MASK, window by window
+        base_ds.close()  # Pass 2: stream SUM/COUNT -> PROB and MASK, window by window
         prob_path = out_dir / f"{tif_path.stem}_prob.tif"
         mask_path = out_dir / f"{tif_path.stem}_mask.tif"
 
@@ -877,20 +930,19 @@ class Trainer:
         print(f"Saved:\n  Prob: {prob_path}\n  Mask: {mask_path}")
         return str(prob_path), str(mask_path)
 
+    # (Your predict / predict_streaming stay the same; omitted here for brevity)
 
-# ---------------------------- #
-# ---------- MAIN ------------ #
-# ---------------------------- #
 
 if __name__ == "__main__":
     # Example usage:
-    trainer = Trainer(tile_size=1024, overlap=512, batch_size=14, threshold=0.45)
-    # trainer.train(
-    #     image_tif_path=Path(DATASET_DIR / "ortho_cog_cropped.tif"),
-    #     label_tif_path=Path(DATASET_DIR / "building_mask.tif"),
-    #     epochs=60,
-    #     reject_empty=True,
-    # )
-    trainer.load_checkpoint("./ckpts/unet_best.pt")
-    trainer.predict_streaming(Path(DATASET_DIR / "ortho.tif"), out_dir="out_small")
-    pass
+    trainer = Trainer(tile_size=1024, overlap=512, batch_size=4, threshold=0.49)
+    trainer.train(
+        image_tif_path=Path(DATASET_DIR / "ortho_cog_cropped.tif"),
+        label_tif_path=Path(DATASET_DIR / "building_mask.tif"),
+        epochs=30,
+        reject_empty=True,
+        num_workers=4,
+    )
+    # trainer.load_checkpoint("./ckpts/deeplabv3p_best.pt")
+    # trainer.predict_streaming(Path(DATASET_DIR / "ortho.tif"), out_dir="out_small")
+    # pass
