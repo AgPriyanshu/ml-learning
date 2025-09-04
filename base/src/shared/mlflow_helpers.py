@@ -1,4 +1,4 @@
-import time, json, os
+import os
 import mlflow
 import psutil
 import torch
@@ -55,8 +55,37 @@ class MlflowLogger:
         params = {k: v for k, v in kwargs.items() if v is not None}
         mlflow.log_params(params)
 
-    def log_metrics(self, metrics: dict, step: int | None = None):
-        mlflow.log_metrics(metrics, step=step)
+    def log_metrics(self, metrics: dict, step: int | None = None, category: str | None = None):
+        """
+        Log metrics with optional category prefix.
+        
+        Args:
+            metrics: Dictionary of metric names and values
+            step: Optional step number for time series tracking
+            category: Optional category prefix (e.g., 'system', 'model', 'train', 'val')
+        """
+        if category:
+            # Add category prefix to metric names
+            prefixed_metrics = {f"{category}.{k}": v for k, v in metrics.items()}
+            mlflow.log_metrics(prefixed_metrics, step=step)
+        else:
+            mlflow.log_metrics(metrics, step=step)
+
+    def log_system_metrics(self, metrics: dict, step: int | None = None):
+        """Log system resource metrics (CPU, GPU, RAM usage)."""
+        self.log_metrics(metrics, step=step, category="system")
+
+    def log_model_metrics(self, metrics: dict, step: int | None = None):
+        """Log training/model metrics (loss, accuracy, dice, etc.)."""
+        self.log_metrics(metrics, step=step, category="model")
+
+    def log_train_metrics(self, metrics: dict, step: int | None = None):
+        """Log training-specific metrics."""
+        self.log_metrics(metrics, step=step, category="train")
+
+    def log_val_metrics(self, metrics: dict, step: int | None = None):
+        """Log validation-specific metrics."""
+        self.log_metrics(metrics, step=step, category="val")
 
     def log_artifact(self, path: str | os.PathLike):
         mlflow.log_artifact(str(path))

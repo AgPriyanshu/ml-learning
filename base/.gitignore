@@ -2,3 +2,5 @@ out_small
 ckpts
 .venv
 __pycache__
+predictions
+SSRS
