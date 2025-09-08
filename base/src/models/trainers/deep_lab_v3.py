@@ -1,49 +1,18 @@
-from __future__ import annotations
-import os
-from pathlib import Path
-import random
-import tempfile
 import time
-from typing import Tuple, List, Optional
+from pathlib import Path
+from typing import  Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
-from torch.amp import autocast, GradScaler
-
-import rasterio
-from rasterio.windows import Window
-from segmentation_models_pytorch import DeepLabV3Plus
-
-from base.src.data.datasets.ortho_dataset import (
-    MultiRasterPairTileDataset,
-    OrthoTileDataset,
-)
-from base.src.models.metrics import dice_coeff, iou_score
-from base.src.models.schedulers import EMA, cosine_with_warmup
-from base.src.data.augmentation import random_brightness_contrast, random_flip_rotate
-from base.src.data.io_utils import (
-    compute_grid,
-    get_file_profile,
-    normalize01_then_standardize,
-    read_mask_tile,
-    read_mask_tile_scaled,
-    read_rgb_tile_scaled,
-)
-from base.src.models.postprocessors.tile_blenders import (
-    apply_tile_weights,
-    create_distance_weight_map,
-    create_gaussian_weight_map,
-)
 from configs import setup_environment
-from base.src.shared.mlflow_helpers import MlflowLogger, get_system_metrics
-from constants import IMAGENET_MEAN, IMAGENET_STD, VALIDATION_SHAHADA_ORTHO_PATH
+from segmentation_models_pytorch import DeepLabV3Plus
+from segmentation_models_pytorch.base import SegmentationModel
+from torch.amp import GradScaler, autocast
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-import torch.nn.functional as F
 
+from src.models.metrics import dice_coeff, iou_score
+from src.shared.mlflow_helpers import MlflowLogger, get_system_metrics
 
 setup_environment()
 
@@ -51,57 +20,33 @@ setup_environment()
 class DeepLabV3Trainer:
     def __init__(
         self,
-        tile_size=1024,
-        overlap=768,  # Increased overlap to 75% for better blending
-        batch_size=2,
-        threshold=0.45,
-        lr=3e-4,
-        weight_decay=1e-2,
-        device: Optional[str] = None,
-        encoder_name: str = "resnet50",
-        encoder_weights: str = "imagenet",
-        backbone_lr_mult: float = 0.5,  # smaller LR for encoder
+        model: SegmentationModel,
+        batch_size,
+        scheduler,
+        optimizer,
+        loss_function,
+        postprocessor: Optional[callable] = None,
+        # Train params.
         freeze_encoder_epochs: int = 1,  # warmup: freeze encoder N epochs
-        use_ema: bool = True,
-        ema_decay: float = 0.999,
-        grad_accum_steps: int = 1,
-        grad_clip_norm: float = 1.0,
+        # Training utils.
+        device=None,
+        ema=None,
         compile_model: bool = False,  # torch.compile for extra speed
-        blending_method: str = "distance",  # "gaussian" or "distance"
-        border_fade: int = None,  # Border fade width for distance blending
+        # grad_clip_norm: float = 1.0,
     ):
-        self.tile_size = tile_size
-        self.overlap = overlap
+        # self.grad_clip_norm = grad_clip_norm
         self.batch_size = batch_size
-        self.threshold = float(threshold)
-        self.lr = lr
-        self.weight_decay = weight_decay
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-
-        # Blending parameters for smooth tile transitions
-        self.blending_method = blending_method
-        self.border_fade = border_fade or (tile_size // 8)
-
-        self.model = (
-            DeepLabV3Plus(
-                encoder_name=encoder_name,
-                encoder_weights=encoder_weights,
-                in_channels=3,
-                classes=1,
-            )
-            .to(self.device)
-            .to(memory_format=torch.channels_last)
-        )
+        self.scheduler = scheduler
+        self.loss_function = loss_function
+        self.model = model
+        self.device = device
+        self.optimizer = optimizer
 
         # Store train knobs
-        self.backbone_lr_mult = backbone_lr_mult
         self.freeze_encoder_epochs = max(0, int(freeze_encoder_epochs))
-        self.grad_accum_steps = max(1, int(grad_accum_steps))
-        self.grad_clip_norm = grad_clip_norm
 
         # EMA
-        self.use_ema = use_ema
-        self.ema = EMA(self.model, ema_decay) if use_ema else None
+        self.ema = ema
 
         # (Optional) compile
         if compile_model and torch.cuda.is_available() and torch.__version__ >= "2.1":
@@ -110,155 +55,22 @@ class DeepLabV3Trainer:
             except Exception:
                 pass  # fall back silently
 
-    def _make_loss(self, pos_weight: float = 2.0):
-        bce = nn.BCEWithLogitsLoss(
-            pos_weight=torch.tensor(pos_weight, device=self.device)
-        )
-
-        def criterion(logits, target, keep_mask):
-            # logits, target: (B,1,H,W); keep_mask: (B,1,H,W) True=use
-            if keep_mask is not None:
-                logits = logits[keep_mask]
-                target = target[keep_mask]
-            loss_bce = bce(logits, target)
-            probs = torch.sigmoid(logits)
-            inter = (probs * target).sum()
-            denom = probs.sum() + target.sum()
-            loss_dice = 1.0 - (2.0 * inter + 1.0) / (denom + 1.0)
-            return 0.5 * loss_bce + 0.5 * loss_dice
-
-        return criterion
-
-    def _make_optimizer(self):
-        # param groups: smaller LR for encoder, larger for decoder/seghead
-        enc_params = list(self.model.encoder.parameters())
-        dec_params = [
-            p for n, p in self.model.named_parameters() if not n.startswith("encoder.")
-        ]
-        param_groups = [
-            {"params": enc_params, "lr": self.lr * self.backbone_lr_mult},
-            {"params": dec_params, "lr": self.lr},
-        ]
-        try:
-            return AdamW(
-                param_groups, lr=self.lr, weight_decay=self.weight_decay, fused=True
-            )
-        except TypeError:
-            return AdamW(param_groups, lr=self.lr, weight_decay=self.weight_decay)
-
-    def load_checkpoint(
-        self,
-        ckpt_path: str | Path,
-        strict: bool = True,
-        map_location: str | torch.device | None = None,
-    ):
-        ckpt_path = Path(ckpt_path)
-        device = self.device if map_location is None else map_location
-        ckpt = torch.load(ckpt_path, map_location=device)
-        state = ckpt.get("model", ckpt)
-        missing, unexpected = self.model.load_state_dict(state, strict=strict)
-        if missing:
-            print(f"[load_checkpoint] Missing keys: {missing}")
-        if unexpected:
-            print(f"[load_checkpoint] Unexpected keys: {unexpected}")
-        print(f"[load_checkpoint] Loaded: {ckpt_path}")
-        self.start_epoch = int(ckpt.get("epoch", 0)) + 1
-        self.best_val = float(ckpt.get("val_dice", float("nan")))
-        self.model.eval()
-
     def train(
         self,
-        ortho_mask_pairs: List[Tuple[Path | str, Path | str]] | None = None,
-        epochs: int = 30,
-        val_split: float = 0.1,
-        pos_weight: float = 2.0,
-        num_workers: int = 2,
-        ckpt_dir: Path | str = "ckpts",
-        amp: bool = True,
-        reject_empty: bool = True,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        epochs: int,
+        ckpt_dir: Path | str = "checkpoints",
+        amp: bool = True,  # Automatic Mixed Precision
         experiment: str = "Footprints-DeepLabV3Plus-Multidataset",
         run_name: str | None = None,
         early_stop_patience: int = 10,
-        augment: bool = True,
-        augment_prob: float = 0.5,
-        # Legacy single-file support (deprecated)
-        image_tif_path: Path | None = None,
-        label_tif_path: Path | None = None,
     ):
         ckpt_dir = Path(ckpt_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-        # Handle dataset setup: use provided pairs or defaults, or legacy single files
-        if ortho_mask_pairs is None:
-            if image_tif_path is not None and label_tif_path is not None:
-                # Legacy single-file mode
-                print(
-                    "Warning: Using legacy single-file mode. Consider using ortho_mask_pairs parameter."
-                )
-                ortho_mask_pairs = [(image_tif_path, label_tif_path)]
-            else:
-                # Default to MOPR and Aarvi datasets
-                ortho_mask_pairs = [
-                    (
-                        "../SSRS/data/MOPR/ortho_cog_cropped.tif",
-                        "../SSRS/data/MOPR/building_mask.tif",
-                    ),
-                    (
-                        "../SSRS/data/Aarvi/ortho.tif",
-                        "../SSRS/data/Aarvi/building_mask.tif",
-                    ),
-                ]
-                print("Using default MOPR and Aarvi datasets")
-
-        dataset = MultiRasterPairTileDataset(
-            ortho_mask_pairs=ortho_mask_pairs,
-            tile_size=self.tile_size,
-            overlap=self.overlap,
-            mean=IMAGENET_MEAN,
-            std=IMAGENET_STD,
-            reject_empty=reject_empty,
-            train_scales=(1, 2, 4),
-            augment=augment,
-            augment_prob=augment_prob,
-        )
-
-        n_total = len(dataset)
-        n_val = max(1, int(val_split * n_total))
-        n_train = n_total - n_val
-        train_ds, val_ds = random_split(
-            dataset, [n_train, n_val], generator=torch.Generator().manual_seed(42)
-        )
-
-        # High-throughput DataLoaders
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=(num_workers > 0),
-            prefetch_factor=2 if num_workers > 0 else None,
-            collate_fn=dataset.collate_pairs,
-            drop_last=True,
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=max(1, num_workers // 2),
-            pin_memory=True,
-            persistent_workers=(num_workers > 0),
-            prefetch_factor=2 if num_workers > 0 else None,
-            collate_fn=dataset.collate_pairs,
-        )
-
-        criterion = self._make_loss(pos_weight=pos_weight)
-        optim = self._make_optimizer()
-        total_steps = max(1, epochs * len(train_loader))
-        scheduler = LambdaLR(
-            optim,
-            cosine_with_warmup(total_steps, warmup_steps=min(1000, total_steps // 10)),
-        )
+        criterion = self.loss_function()
+        scheduler = self.scheduler
         scaler = GradScaler(enabled=(amp and self.device == "cuda"))
 
         best_val = -1.0
@@ -266,38 +78,24 @@ class DeepLabV3Trainer:
 
         # Optionally freeze encoder for warmup epochs
         if self.freeze_encoder_epochs > 0:
-            for p in self.model.encoder.parameters():
-                p.requires_grad = False
+            for parameter in self.model.encoder.parameters():
+                parameter.requires_grad = False
 
         with MlflowLogger(experiment=experiment, run_name=run_name) as mlf:
             mlf.log_params(
-                tile_size=self.tile_size,
-                overlap=self.overlap,
                 batch_size=self.batch_size,
-                lr=self.lr,
-                backbone_lr_mult=self.backbone_lr_mult,
-                weight_decay=self.weight_decay,
                 epochs=epochs,
-                pos_weight=pos_weight,
-                val_split=val_split,
                 amp=amp,
-                reject_empty=reject_empty,
                 device=self.device,
                 freeze_encoder_epochs=self.freeze_encoder_epochs,
-                grad_accum_steps=self.grad_accum_steps,
-                grad_clip_norm=self.grad_clip_norm,
-                use_ema=self.use_ema,
-                augment=augment,
-                augment_prob=augment_prob,
-                num_datasets=len(ortho_mask_pairs),
             )
 
             global_step = 0
             for ep in range(1, epochs + 1):
                 # Unfreeze encoder after warmup
                 if ep == (self.freeze_encoder_epochs + 1):
-                    for p in self.model.encoder.parameters():
-                        p.requires_grad = True
+                    for parameter in self.model.encoder.parameters():
+                        parameter.requires_grad = True
 
                 self.model.train()
                 loss_sum, n_imgs = 0.0, 0
@@ -309,7 +107,7 @@ class DeepLabV3Trainer:
                     leave=False,
                 )
 
-                optim.zero_grad(set_to_none=True)
+                self.optimizer.zero_grad(set_to_none=True)
                 for bidx, (imgs, targs, keep) in enumerate(train_bar, start=1):
                     imgs = imgs.to(self.device, non_blocking=True).to(
                         memory_format=torch.channels_last
@@ -322,30 +120,22 @@ class DeepLabV3Trainer:
                         device_type="cuda", enabled=(amp and self.device == "cuda")
                     ):
                         logits = self.model(imgs)
-                        loss = criterion(logits, targs, keep) / self.grad_accum_steps
+                        loss = criterion(logits, targs, keep)
 
                     scaler.scale(loss).backward()
+                    scaler.step(self.optimizer)
+                    scaler.update()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    scheduler.step()
 
-                    # Gradient accumulation
-                    if (bidx % self.grad_accum_steps) == 0:
-                        if self.grad_clip_norm is not None and self.grad_clip_norm > 0:
-                            scaler.unscale_(optim)
-                            torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(), self.grad_clip_norm
-                            )
-                        scaler.step(optim)
-                        scaler.update()
-                        optim.zero_grad(set_to_none=True)
-                        scheduler.step()
+                    # EMA update after optimizer step
+                    if self.ema is not None:
+                        self.ema.update(self.model)
 
-                        # EMA update after optimizer step
-                        if self.use_ema:
-                            self.ema.update(self.model)
-
-                    loss_sum += loss.item() * self.grad_accum_steps
+                    loss_sum += loss.item()
                     global_step += 1
 
-                    cur_lr = optim.param_groups[0]["lr"]
+                    cur_lr = self.optimizer.param_groups[0]["lr"]
                     elapsed = max(1e-6, time.time() - t_start)
                     ips = n_imgs / elapsed
                     train_bar.set_postfix(
@@ -361,7 +151,7 @@ class DeepLabV3Trainer:
                 # ---- Validate (use EMA weights if enabled) ----
                 self.model.eval()
                 eval_model = self.model
-                if self.use_ema:
+                if self.ema is not None:
                     # temp swap: copy EMA weights into a shadow model for eval
                     eval_model = (
                         DeepLabV3Plus(
@@ -422,7 +212,7 @@ class DeepLabV3Trainer:
                 # Log training metrics
                 train_metrics = {
                     "loss": train_loss,
-                    "lr": optim.param_groups[0]["lr"],
+                    "lr": self.optimizer.param_groups[0]["lr"],
                     "images_per_sec": ips_epoch,
                 }
                 mlf.log_train_metrics(train_metrics, step=ep)
@@ -446,7 +236,7 @@ class DeepLabV3Trainer:
                     bad_epochs = 0
                     ckpt_path = Path(ckpt_dir) / "deeplabv3p_best_overviews.pt"
                     to_save = self.model.state_dict()
-                    if self.use_ema:
+                    if self.ema is not None:
                         # Save EMA weights (often better at inference)
                         ema_copy = {k: v.clone() for k, v in self.ema.shadow.items()}
                         for k, v in ema_copy.items():
@@ -474,298 +264,316 @@ class DeepLabV3Trainer:
 
         return best_val
 
-    def predict_streaming(
+    # def predict(
+    #     self,
+    #     tif_path: Path,
+    #     threshold: float,
+    #     out_dir: Path | str = "out_stream",
+    #     num_workers: int = 2,
+    #     amp: bool = True,
+    #     blocksize: int = 1024,
+    #     tmp_dir: str | None = None,
+    #     show_bar: bool = True,
+    #     predict_scales: tuple[int, ...] = (1, 2),  # << NEW
+    # ):
+    #     """
+    #     Streaming prediction for huge orthos (e.g., 40 GB) with O(tiles) memory.
+    #     Writes intermediate SUM and COUNT rasters to disk (tiled BigTIFF), updates them per-tile,
+    #     then streams a final pass to produce PROB and binary MASK GeoTIFFs.
+    #     """
+    #     tif_path = Path(tif_path)
+    #     out_dir = Path(out_dir)
+    #     out_dir.mkdir(parents=True, exist_ok=True)
+
+    #     # Dataset & loader
+    #     dataset = OrthoTileDataset(
+    #         tif_path,
+    #         tile_size=self.tile_size,
+    #         overlap=self.overlap,
+    #     )
+
+    #     loader = DataLoader(
+    #         dataset,
+    #         batch_size=self.batch_size,
+    #         shuffle=False,
+    #         num_workers=num_workers,
+    #         persistent_workers=(num_workers > 0),
+    #         prefetch_factor=2 if num_workers > 0 else None,
+    #         pin_memory=True,
+    #         collate_fn=dataset.collate_tiles,
+    #     )
+
+    #     H, W = dataset.H, dataset.W
+    #     total_tiles = len(dataset)
+
+    #     # Reference profile
+    #     ref_profile = get_file_profile(tif_path)
+
+    #     # Create temp folder
+    #     tmp_dir = tmp_dir or tempfile.mkdtemp(prefix="footprints_tmp_")
+    #     sum_tif = Path(tmp_dir) / f"{tif_path.stem}_sum.tif"
+    #     cnt_tif = Path(tmp_dir) / f"{tif_path.stem}_cnt.tif"
+
+    #     # Create on-disk SUM (float32) and COUNT (uint16) rasters
+    #     sum_profile = ref_profile.copy()
+    #     sum_profile.update(
+    #         driver="GTiff",
+    #         dtype="float32",
+    #         count=1,
+    #         compress="deflate",
+    #         predictor=2,
+    #         tiled=True,
+    #         blockxsize=blocksize,
+    #         blockysize=blocksize,
+    #         BIGTIFF="YES",
+    #     )
+    #     cnt_profile = ref_profile.copy()
+    #     cnt_profile.update(
+    #         driver="GTiff",
+    #         dtype="float32",  # Changed to float32 for weight accumulation
+    #         count=1,
+    #         compress="deflate",
+    #         predictor=2,  # Use predictor=2 for float data
+    #         tiled=True,
+    #         blockxsize=blocksize,
+    #         blockysize=blocksize,
+    #         BIGTIFF="YES",
+    #     )
+
+    #     # Create/initialize files
+    #     with rasterio.open(sum_tif, "w", **sum_profile):
+    #         pass
+    #     with rasterio.open(cnt_tif, "w", **cnt_profile):
+    #         pass
+
+    #     # Create weight map for smooth tile blending
+    #     if self.blending_method == "gaussian":
+    #         weight_map = create_gaussian_weight_map(self.tile_size, sigma_factor=0.3)
+    #     else:  # distance blending
+    #         weight_map = create_distance_weight_map(self.tile_size, self.border_fade)
+
+    #     print(
+    #         f"Using {self.blending_method} blending with tile_size={self.tile_size}, overlap={self.overlap}"
+    #     )
+
+    #     # Speed/VRAM tweaks
+    #     torch.backends.cudnn.benchmark = True
+    #     self.model.eval()
+    #     # channels_last can help with NHWC kernels on Ampere+
+    #     self.model.to(memory_format=torch.channels_last)
+
+    #     processed = 0
+    #     t0 = time.time()
+    #     iterator = (
+    #         tqdm(
+    #             loader,
+    #             total=len(loader),
+    #             unit="batch",
+    #             desc="Predict (stream)",
+    #             leave=False,
+    #         )
+    #         if show_bar
+    #         else loader
+    #     )
+
+    #     # Pass 1: accumulate per tile into SUM/COUNT rasters on disk
+    #     # Open base once to avoid re-opening per tile
+    #     base_ds = rasterio.open(tif_path)
+
+    #     with torch.no_grad(), autocast("cuda"):
+    #         for tiles, metas in iterator:
+    #             # We will ignore 'tiles' (full-res) and read per-scale directly from base_ds
+    #             ms_logits_sum = None  # will be torch tensor (B,1,T,T)
+
+    #             for scale in predict_scales:
+    #                 # Build a batch at this scale by reading windows with out_shape
+    #                 batch_list = []
+    #                 for m in metas:
+    #                     y0, x0, h, w = (
+    #                         int(m["y0"]),
+    #                         int(m["x0"]),
+    #                         int(m["h"]),
+    #                         int(m["w"]),
+    #                     )
+    #                     # scaled read (3,hs,ws)
+    #                     rgb_s, _ = read_rgb_tile_scaled(
+    #                         base_ds, x0, y0, self.tile_size, dataset.W, dataset.H, scale
+    #                     )
+    #                     rgb_s = normalize01_then_standardize(
+    #                         rgb_s, IMAGENET_MEAN, IMAGENET_STD
+    #                     )
+    #                     t = torch.from_numpy(rgb_s).unsqueeze(0)  # (1,3,hs,ws)
+    #                     t = F.interpolate(
+    #                         t,
+    #                         size=(self.tile_size, self.tile_size),
+    #                         mode="bilinear",
+    #                         align_corners=False,
+    #                     ).squeeze(0)
+    #                     batch_list.append(t)
+    #                 batch = torch.stack(batch_list, dim=0).to(
+    #                     self.device, non_blocking=True
+    #                 )  # (B,3,T,T)
+    #                 batch = batch.to(memory_format=torch.channels_last)
+
+    #                 logits = self.model(batch)  # (B,1,T,T)
+    #                 ms_logits_sum = (
+    #                     logits if ms_logits_sum is None else (ms_logits_sum + logits)
+    #                 )
+
+    #             # Average across scales, then to probs (CPU) for accumulation
+    #             logits_avg = ms_logits_sum / float(len(predict_scales))
+    #             probs = (
+    #                 torch.sigmoid(logits_avg).squeeze(1).float().cpu().numpy()
+    #             )  # (B,T,T)
+
+    #             # Update SUM/COUNT windows with weighted blending
+    #             with rasterio.open(
+    #                 sum_tif, "r+", sharing=False
+    #             ) as sum_ds, rasterio.open(cnt_tif, "r+", sharing=False) as cnt_ds:
+    #                 for p, m in zip(probs, metas):
+    #                     y0, x0, h, w = (
+    #                         int(m["y0"]),
+    #                         int(m["x0"]),
+    #                         int(m["h"]),
+    #                         int(m["w"]),
+    #                     )
+    #                     win = Window(x0, y0, w, h)
+
+    #                     # Apply spatial weights to tile prediction
+    #                     tile_pred = p[:h, :w].astype(np.float32)
+    #                     # TODO: Use PostProcessor
+    #                     tile_weights = weight_map[:h, :w]
+    #                     weighted_pred = apply_tile_weights(tile_pred, tile_weights)
+
+    #                     # Read current accumulated values
+    #                     cur_sum = sum_ds.read(1, window=win)
+    #                     cur_cnt = cnt_ds.read(1, window=win)
+
+    #                     # Accumulate weighted predictions and weights
+    #                     cur_sum += weighted_pred
+    #                     cur_cnt += (
+    #                         tile_weights  # Accumulate weights instead of just counting
+    #                     )
+
+    #                     # Write back
+    #                     sum_ds.write(cur_sum, 1, window=win)
+    #                     cnt_ds.write(cur_cnt, 1, window=win)
+
+    #             processed += len(metas)
+    #             if show_bar:
+    #                 elapsed = max(1e-6, time.time() - t0)
+    #                 iterator.set_postfix(
+    #                     {
+    #                         "tiles": f"{processed}/{total_tiles}",
+    #                         "t/s": f"{processed/elapsed:.2f}",
+    #                     }
+    #                 )
+
+    #     base_ds.close()  # Pass 2: stream SUM/COUNT -> PROB and MASK, window by window
+    #     prob_path = out_dir / f"{tif_path.stem}_prob.tif"
+    #     mask_path = out_dir / f"{tif_path.stem}_mask.tif"
+
+    #     prob_profile = ref_profile.copy()
+    #     prob_profile.update(
+    #         driver="GTiff",
+    #         dtype="float32",
+    #         count=1,
+    #         compress="deflate",
+    #         predictor=2,
+    #         tiled=True,
+    #         blockxsize=blocksize,
+    #         blockysize=blocksize,
+    #         BIGTIFF="YES",
+    #     )
+    #     mask_profile = ref_profile.copy()
+    #     mask_profile.update(
+    #         driver="GTiff",
+    #         dtype="uint8",
+    #         count=1,
+    #         compress="deflate",
+    #         predictor=1,
+    #         tiled=True,
+    #         blockxsize=blocksize,
+    #         blockysize=blocksize,
+    #         BIGTIFF="YES",
+    #     )
+
+    #     # Prepare block grid for streaming division
+    #     bx, by = blocksize, blocksize
+    #     xs = list(range(0, W, bx))
+    #     ys = list(range(0, H, by))
+    #     if xs[-1] + bx < W:
+    #         xs.append(W - bx)
+    #     if ys[-1] + by < H:
+    #         ys.append(H - by)
+    #     blocks = [(y, x) for y in ys for x in xs]
+
+    #     it2 = (
+    #         tqdm(blocks, desc="Finalize (sum/count→prob)", unit="block", leave=False)
+    #         if show_bar
+    #         else blocks
+    #     )
+
+    #     with rasterio.open(sum_tif, "r") as sum_ds, rasterio.open(
+    #         cnt_tif, "r"
+    #     ) as cnt_ds, rasterio.open(
+    #         prob_path, "w", **prob_profile
+    #     ) as prob_ds, rasterio.open(
+    #         mask_path, "w", **mask_profile
+    #     ) as mask_ds:
+
+    #         for y0, x0 in it2:
+    #             w = min(bx, W - x0)
+    #             h = min(by, H - y0)
+    #             win = Window(x0, y0, w, h)
+
+    #             s = sum_ds.read(1, window=win).astype(np.float32)
+    #             c = cnt_ds.read(1, window=win).astype(np.float32)
+
+    #             # Normalize by accumulated weights (avoid div-by-zero)
+    #             prob_block = np.zeros_like(s, dtype=np.float32)
+    #             # Use a small threshold to avoid division by very small weights
+    #             weight_threshold = 1e-6
+    #             valid_weights = c > weight_threshold
+    #             prob_block[valid_weights] = s[valid_weights] / c[valid_weights]
+
+    #             mask_block = (prob_block >= threshold).astype(np.uint8)
+
+    #             prob_ds.write(prob_block, 1, window=win)
+    #             mask_ds.write(mask_block, 1, window=win)
+
+    #     # Optional: clean up tmp files
+    #     try:
+    #         os.remove(sum_tif)
+    #         os.remove(cnt_tif)
+    #     except Exception:
+    #         pass
+
+    #     total_secs = time.time() - t0
+    #     if show_bar:
+    #         tqdm.write(
+    #             f"Streaming prediction done in {total_secs:.2f}s for {total_tiles} tiles"
+    #         )
+
+    #     print(f"Saved:\n  Prob: {prob_path}\n  Mask: {mask_path}")
+    #     return str(prob_path), str(mask_path)
+
+    def load_checkpoint(
         self,
-        tif_path: Path,
-        out_dir: Path | str = "out_stream",
-        num_workers: int = 2,
-        amp: bool = True,
-        blocksize: int = 1024,
-        tmp_dir: str | None = None,
-        show_bar: bool = True,
-        predict_scales: tuple[int, ...] = (1, 2),  # << NEW
+        ckpt_path: str | Path,
+        strict: bool = True,
+        map_location: str | torch.device | None = None,
     ):
-        """
-        Streaming prediction for huge orthos (e.g., 40 GB) with O(tiles) memory.
-        Writes intermediate SUM and COUNT rasters to disk (tiled BigTIFF), updates them per-tile,
-        then streams a final pass to produce PROB and binary MASK GeoTIFFs.
-        """
-        tif_path = Path(tif_path)
-        out_dir = Path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        # Dataset & loader
-        dataset = OrthoTileDataset(
-            tif_path,
-            tile_size=self.tile_size,
-            overlap=self.overlap,
-            mean=IMAGENET_MEAN,
-            std=IMAGENET_STD,
-        )
-
-        loader = DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            persistent_workers=(num_workers > 0),
-            prefetch_factor=2 if num_workers > 0 else None,
-            pin_memory=True,
-            collate_fn=dataset.collate_tiles,
-        )
-
-        H, W = dataset.H, dataset.W
-        total_tiles = len(dataset)
-
-        # Reference profile
-        ref_profile = get_file_profile(tif_path)
-
-        # Create temp folder
-        tmp_dir = tmp_dir or tempfile.mkdtemp(prefix="footprints_tmp_")
-        sum_tif = Path(tmp_dir) / f"{tif_path.stem}_sum.tif"
-        cnt_tif = Path(tmp_dir) / f"{tif_path.stem}_cnt.tif"
-
-        # Create on-disk SUM (float32) and COUNT (uint16) rasters
-        sum_profile = ref_profile.copy()
-        sum_profile.update(
-            driver="GTiff",
-            dtype="float32",
-            count=1,
-            compress="deflate",
-            predictor=2,
-            tiled=True,
-            blockxsize=blocksize,
-            blockysize=blocksize,
-            BIGTIFF="YES",
-        )
-        cnt_profile = ref_profile.copy()
-        cnt_profile.update(
-            driver="GTiff",
-            dtype="float32",  # Changed to float32 for weight accumulation
-            count=1,
-            compress="deflate",
-            predictor=2,  # Use predictor=2 for float data
-            tiled=True,
-            blockxsize=blocksize,
-            blockysize=blocksize,
-            BIGTIFF="YES",
-        )
-
-        # Create/initialize files
-        with rasterio.open(sum_tif, "w", **sum_profile):
-            pass
-        with rasterio.open(cnt_tif, "w", **cnt_profile):
-            pass
-
-        # Create weight map for smooth tile blending
-        if self.blending_method == "gaussian":
-            weight_map = create_gaussian_weight_map(self.tile_size, sigma_factor=0.3)
-        else:  # distance blending
-            weight_map = create_distance_weight_map(self.tile_size, self.border_fade)
-
-        print(
-            f"Using {self.blending_method} blending with tile_size={self.tile_size}, overlap={self.overlap}"
-        )
-
-        # Speed/VRAM tweaks
-        torch.backends.cudnn.benchmark = True
+        ckpt_path = Path(ckpt_path)
+        device = self.device if map_location is None else map_location
+        ckpt = torch.load(ckpt_path, map_location=device)
+        state = ckpt.get("model", ckpt)
+        missing, unexpected = self.model.load_state_dict(state, strict=strict)
+        if missing:
+            print(f"[load_checkpoint] Missing keys: {missing}")
+        if unexpected:
+            print(f"[load_checkpoint] Unexpected keys: {unexpected}")
+        print(f"[load_checkpoint] Loaded: {ckpt_path}")
+        self.start_epoch = int(ckpt.get("epoch", 0)) + 1
+        self.best_val = float(ckpt.get("val_dice", float("nan")))
         self.model.eval()
-        # channels_last can help with NHWC kernels on Ampere+
-        self.model.to(memory_format=torch.channels_last)
-
-        processed = 0
-        t0 = time.time()
-        iterator = (
-            tqdm(
-                loader,
-                total=len(loader),
-                unit="batch",
-                desc="Predict (stream)",
-                leave=False,
-            )
-            if show_bar
-            else loader
-        )
-
-        # Pass 1: accumulate per tile into SUM/COUNT rasters on disk
-        # Open base once to avoid re-opening per tile
-        base_ds = rasterio.open(tif_path)
-
-        with torch.no_grad(), autocast("cuda"):
-            for tiles, metas in iterator:
-                # We will ignore 'tiles' (full-res) and read per-scale directly from base_ds
-                ms_logits_sum = None  # will be torch tensor (B,1,T,T)
-
-                for scale in predict_scales:
-                    # Build a batch at this scale by reading windows with out_shape
-                    batch_list = []
-                    for m in metas:
-                        y0, x0, h, w = (
-                            int(m["y0"]),
-                            int(m["x0"]),
-                            int(m["h"]),
-                            int(m["w"]),
-                        )
-                        # scaled read (3,hs,ws)
-                        rgb_s, _ = read_rgb_tile_scaled(
-                            base_ds, x0, y0, self.tile_size, dataset.W, dataset.H, scale
-                        )
-                        rgb_s = normalize01_then_standardize(
-                            rgb_s, IMAGENET_MEAN, IMAGENET_STD
-                        )
-                        t = torch.from_numpy(rgb_s).unsqueeze(0)  # (1,3,hs,ws)
-                        t = F.interpolate(
-                            t,
-                            size=(self.tile_size, self.tile_size),
-                            mode="bilinear",
-                            align_corners=False,
-                        ).squeeze(0)
-                        batch_list.append(t)
-                    batch = torch.stack(batch_list, dim=0).to(
-                        self.device, non_blocking=True
-                    )  # (B,3,T,T)
-                    batch = batch.to(memory_format=torch.channels_last)
-
-                    logits = self.model(batch)  # (B,1,T,T)
-                    ms_logits_sum = (
-                        logits if ms_logits_sum is None else (ms_logits_sum + logits)
-                    )
-
-                # Average across scales, then to probs (CPU) for accumulation
-                logits_avg = ms_logits_sum / float(len(predict_scales))
-                probs = (
-                    torch.sigmoid(logits_avg).squeeze(1).float().cpu().numpy()
-                )  # (B,T,T)
-
-                # Update SUM/COUNT windows with weighted blending
-                with rasterio.open(
-                    sum_tif, "r+", sharing=False
-                ) as sum_ds, rasterio.open(cnt_tif, "r+", sharing=False) as cnt_ds:
-                    for p, m in zip(probs, metas):
-                        y0, x0, h, w = (
-                            int(m["y0"]),
-                            int(m["x0"]),
-                            int(m["h"]),
-                            int(m["w"]),
-                        )
-                        win = Window(x0, y0, w, h)
-
-                        # Apply spatial weights to tile prediction
-                        tile_pred = p[:h, :w].astype(np.float32)
-                        tile_weights = weight_map[:h, :w]
-                        weighted_pred = apply_tile_weights(tile_pred, tile_weights)
-
-                        # Read current accumulated values
-                        cur_sum = sum_ds.read(1, window=win)
-                        cur_cnt = cnt_ds.read(1, window=win)
-
-                        # Accumulate weighted predictions and weights
-                        cur_sum += weighted_pred
-                        cur_cnt += (
-                            tile_weights  # Accumulate weights instead of just counting
-                        )
-
-                        # Write back
-                        sum_ds.write(cur_sum, 1, window=win)
-                        cnt_ds.write(cur_cnt, 1, window=win)
-
-                processed += len(metas)
-                if show_bar:
-                    elapsed = max(1e-6, time.time() - t0)
-                    iterator.set_postfix(
-                        {
-                            "tiles": f"{processed}/{total_tiles}",
-                            "t/s": f"{processed/elapsed:.2f}",
-                        }
-                    )
-
-        base_ds.close()  # Pass 2: stream SUM/COUNT -> PROB and MASK, window by window
-        prob_path = out_dir / f"{tif_path.stem}_prob.tif"
-        mask_path = out_dir / f"{tif_path.stem}_mask.tif"
-
-        prob_profile = ref_profile.copy()
-        prob_profile.update(
-            driver="GTiff",
-            dtype="float32",
-            count=1,
-            compress="deflate",
-            predictor=2,
-            tiled=True,
-            blockxsize=blocksize,
-            blockysize=blocksize,
-            BIGTIFF="YES",
-        )
-        mask_profile = ref_profile.copy()
-        mask_profile.update(
-            driver="GTiff",
-            dtype="uint8",
-            count=1,
-            compress="deflate",
-            predictor=1,
-            tiled=True,
-            blockxsize=blocksize,
-            blockysize=blocksize,
-            BIGTIFF="YES",
-        )
-
-        # Prepare block grid for streaming division
-        bx, by = blocksize, blocksize
-        xs = list(range(0, W, bx))
-        ys = list(range(0, H, by))
-        if xs[-1] + bx < W:
-            xs.append(W - bx)
-        if ys[-1] + by < H:
-            ys.append(H - by)
-        blocks = [(y, x) for y in ys for x in xs]
-
-        it2 = (
-            tqdm(blocks, desc="Finalize (sum/count→prob)", unit="block", leave=False)
-            if show_bar
-            else blocks
-        )
-
-        with rasterio.open(sum_tif, "r") as sum_ds, rasterio.open(
-            cnt_tif, "r"
-        ) as cnt_ds, rasterio.open(
-            prob_path, "w", **prob_profile
-        ) as prob_ds, rasterio.open(
-            mask_path, "w", **mask_profile
-        ) as mask_ds:
-
-            for y0, x0 in it2:
-                w = min(bx, W - x0)
-                h = min(by, H - y0)
-                win = Window(x0, y0, w, h)
-
-                s = sum_ds.read(1, window=win).astype(np.float32)
-                c = cnt_ds.read(1, window=win).astype(np.float32)
-
-                # Normalize by accumulated weights (avoid div-by-zero)
-                prob_block = np.zeros_like(s, dtype=np.float32)
-                # Use a small threshold to avoid division by very small weights
-                weight_threshold = 1e-6
-                valid_weights = c > weight_threshold
-                prob_block[valid_weights] = s[valid_weights] / c[valid_weights]
-
-                mask_block = (prob_block >= self.threshold).astype(np.uint8)
-
-                prob_ds.write(prob_block, 1, window=win)
-                mask_ds.write(mask_block, 1, window=win)
-
-        # Optional: clean up tmp files
-        try:
-            os.remove(sum_tif)
-            os.remove(cnt_tif)
-        except Exception:
-            pass
-
-        total_secs = time.time() - t0
-        if show_bar:
-            tqdm.write(
-                f"Streaming prediction done in {total_secs:.2f}s for {total_tiles} tiles"
-            )
-
-        print(f"Saved:\n  Prob: {prob_path}\n  Mask: {mask_path}")
-        return str(prob_path), str(mask_path)
-
-    # (Your predict / predict_streaming stay the same; omitted here for brevity)

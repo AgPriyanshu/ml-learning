@@ -1,9 +1,9 @@
 import torch
 
 
-def bce_loss(self, pos_weight: float = 2.0):
+def bce_loss( pos_weight: float = 2.0, device: str = "cuda"):
     bce = torch.nn.BCEWithLogitsLoss(
-        pos_weight=torch.tensor(pos_weight, device=self.device)
+        pos_weight=torch.tensor(pos_weight, device=device)
     )
 
     def criterion(logits, target, keep_mask):
