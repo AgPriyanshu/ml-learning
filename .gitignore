@@ -164,7 +164,6 @@ wandb
 
 # Model weights
 *.pth
-models
 
 # SSRS
 SSRS
