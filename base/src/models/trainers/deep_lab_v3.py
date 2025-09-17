@@ -42,7 +42,6 @@ class DeepLabV3Trainer:
         compile_model: bool = False,  # torch.compile for extra speed
         # grad_clip_norm: float = 1.0,
     ):
-        # self.grad_clip_norm = grad_clip_norm
         self.batch_size = batch_size
         self.loss_function = loss_function
         self.model = model
