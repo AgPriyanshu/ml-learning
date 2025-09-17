@@ -16,7 +16,7 @@ from torch.amp import autocast, GradScaler
 import rasterio
 from rasterio.windows import Window
 from segmentation_models_pytorch import Unet
-from base.src.shared.mlflow_helpers import MlflowLogger, get_system_metrics
+from base.src.shared.mlflow_helpers import MlflowLogger
 from shared.constants import DATASET_DIR, ORTHO_FILE_PATH
 from tqdm.auto import tqdm
 
@@ -540,7 +540,6 @@ class Trainer:
                 ips_epoch = n_imgs / secs
 
                 # ---- Log metrics to MLflow ----
-                sysm = get_system_metrics(self.device)
                 mlf.log_metrics(
                     {
                         "train_loss": train_loss,
@@ -548,7 +547,6 @@ class Trainer:
                         "val_iou": val_iou,
                         "lr": optim.param_groups[0]["lr"],
                         "images_per_sec": ips_epoch,
-                        **sysm,
                     },
                     step=ep,
                 )

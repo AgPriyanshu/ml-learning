@@ -1,50 +1,46 @@
 import os
 import mlflow
-import psutil
-import torch
-
-try:
-    import GPUtil
-except Exception:
-    GPUtil = None
 
 MLFLOW_TRACKING_URI = "http://100.107.183.71:5000"
 
 
-def get_system_metrics(device: str):
-    """Return dict of CPU/GPU/RAM metrics (best-effort)."""
-    m = {}
-    # CPU / RAM
-    m["cpu_percent"] = float(psutil.cpu_percent(interval=None))
-    vm = psutil.virtual_memory()
-    m["ram_gb"] = round((vm.used / (1024**3)), 3)
-
-    # GPU (if available)
-    if device == "cuda" and torch.cuda.is_available():
-        # torch-based mem (current process)
-        m["gpu_mem_gb_alloc"] = round(torch.cuda.memory_allocated() / (1024**3), 3)
-        m["gpu_mem_gb_reserved"] = round(torch.cuda.memory_reserved() / (1024**3), 3)
-        # overall GPU util via GPUtil (optional)
-        if GPUtil:
-            try:
-                g = GPUtil.getGPUs()[0]
-                m["gpu_util"] = float(g.load) * 100.0
-                m["gpu_mem_gb_total"] = round(g.memoryTotal / 1024, 3)
-                m["gpu_mem_gb_used"] = round(g.memoryUsed / 1024, 3)
-            except Exception:
-                pass
-    return m
-
-
 class MlflowLogger:
-    def __init__(self, experiment="Footprints-UNet", run_name=None):
+    def __init__(
+        self, 
+        experiment="Footprints-UNet", 
+        run_name=None, 
+        enable_system_metrics=True,
+        system_metrics_sampling_interval=10,
+        system_metrics_samples_before_logging=1
+    ):
+        """
+        Initialize MLflow logger with system metrics support.
+        
+        Args:
+            experiment: Name of the MLflow experiment
+            run_name: Optional name for the specific run
+            enable_system_metrics: Whether to enable MLflow's built-in system metrics logging
+            system_metrics_sampling_interval: Interval in seconds between system metrics samples
+            system_metrics_samples_before_logging: Number of samples to aggregate before logging
+        """
         mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
         mlflow.set_experiment(experiment)
+        
         self.run = None
         self.run_name = run_name
+        self.enable_system_metrics = enable_system_metrics
+        
+        # Configure system metrics sampling if custom values provided
+        if system_metrics_sampling_interval != 10:
+            mlflow.set_system_metrics_sampling_interval(system_metrics_sampling_interval)
+        if system_metrics_samples_before_logging != 1:
+            mlflow.set_system_metrics_samples_before_logging(system_metrics_samples_before_logging)
 
     def __enter__(self):
-        self.run = mlflow.start_run(run_name=self.run_name)
+        self.run = mlflow.start_run(
+            run_name=self.run_name, 
+            log_system_metrics=self.enable_system_metrics
+        )
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -71,9 +67,6 @@ class MlflowLogger:
         else:
             mlflow.log_metrics(metrics, step=step)
 
-    def log_system_metrics(self, metrics: dict, step: int | None = None):
-        """Log system resource metrics (CPU, GPU, RAM usage)."""
-        self.log_metrics(metrics, step=step, category="system")
 
     def log_model_metrics(self, metrics: dict, step: int | None = None):
         """Log training/model metrics (loss, accuracy, dice, etc.)."""
@@ -92,3 +85,26 @@ class MlflowLogger:
 
     def log_dict(self, d: dict, artifact_file: str = "metrics.json"):
         mlflow.log_dict(d, artifact_file)
+    
+    @staticmethod
+    def enable_system_metrics_logging():
+        """Enable MLflow system metrics logging globally."""
+        mlflow.enable_system_metrics_logging()
+    
+    @staticmethod
+    def disable_system_metrics_logging():
+        """Disable MLflow system metrics logging globally."""
+        mlflow.disable_system_metrics_logging()
+    
+    @staticmethod
+    def set_system_metrics_config(sampling_interval: int = None, samples_before_logging: int = None):
+        """Configure system metrics logging parameters.
+        
+        Args:
+            sampling_interval: Interval in seconds between system metrics samples
+            samples_before_logging: Number of samples to aggregate before logging
+        """
+        if sampling_interval is not None:
+            mlflow.set_system_metrics_sampling_interval(sampling_interval)
+        if samples_before_logging is not None:
+            mlflow.set_system_metrics_samples_before_logging(samples_before_logging)

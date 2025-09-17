@@ -1,9 +1,14 @@
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import  Optional
 
 import numpy as np
+import rasterio
 import torch
+import cv2
+from scipy import ndimage
 from configs import setup_environment
 from segmentation_models_pytorch import DeepLabV3Plus
 from segmentation_models_pytorch.base import SegmentationModel
@@ -11,8 +16,13 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from src.data.datasets.ortho_dataset import OrthoTileDataset
+from src.data.io_utils import get_file_profile, normalize01_then_standardize, read_rgb_tile_scaled
+from src.models.postprocessors.tile_blenders import apply_tile_weights, create_gaussian_weight_map
+from src.shared.constants import IMAGENET_MEAN, IMAGENET_STD
 from src.models.metrics import dice_coeff, iou_score
-from src.shared.mlflow_helpers import MlflowLogger, get_system_metrics
+from src.shared.mlflow_helpers import MlflowLogger
+from rasterio.windows import Window
 
 setup_environment()
 
@@ -22,8 +32,6 @@ class DeepLabV3Trainer:
         self,
         model: SegmentationModel,
         batch_size,
-        scheduler,
-        optimizer,
         loss_function,
         postprocessor: Optional[callable] = None,
         # Train params.
@@ -36,11 +44,9 @@ class DeepLabV3Trainer:
     ):
         # self.grad_clip_norm = grad_clip_norm
         self.batch_size = batch_size
-        self.scheduler = scheduler
         self.loss_function = loss_function
         self.model = model
         self.device = device
-        self.optimizer = optimizer
 
         # Store train knobs
         self.freeze_encoder_epochs = max(0, int(freeze_encoder_epochs))
@@ -55,10 +61,63 @@ class DeepLabV3Trainer:
             except Exception:
                 pass  # fall back silently
 
+    def filter_vegetation_false_positives(
+        self, imgs: torch.Tensor, probs: torch.Tensor, vegetation_threshold: float = 0.15
+    ) -> torch.Tensor:
+        """
+        Remove building predictions in areas likely to be vegetation using RGB analysis.
+        
+        Args:
+            imgs: RGB images (B, 3, H, W) normalized with ImageNet stats
+            probs: Building probability maps (B, 1, H, W)
+            vegetation_threshold: Threshold for vegetation detection (higher = more strict)
+        
+        Returns:
+            Filtered probability maps with reduced vegetation false positives
+        """
+        # Denormalize from ImageNet normalization to [0,1]
+        mean = torch.tensor([0.485, 0.456, 0.406], device=imgs.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=imgs.device).view(1, 3, 1, 1)
+        
+        rgb = imgs * std + mean  # Back to [0,1]
+        rgb = torch.clamp(rgb, 0, 1)
+        
+        # Extract RGB channels
+        r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+        
+        # Vegetation indicators
+        # 1. Excess Green Index: 2*G - R - B (higher for vegetation)
+        exg = 2 * g - r - b
+        
+        # 2. Green-Red difference (vegetation has high green, low red)
+        gr_diff = g - r
+        
+        # 3. Normalized green excess relative to overall brightness
+        intensity = (r + g + b) / 3.0
+        norm_green = (g - intensity) / (intensity + 1e-6)
+        
+        # 4. Green dominance: how much green exceeds other channels
+        green_dominance = g - torch.max(r, b)
+        
+        # Combine vegetation indicators (higher = more vegetation-like)
+        vegetation_score = (exg + gr_diff + norm_green + green_dominance) / 4.0
+        
+        # Create vegetation mask: areas likely to be vegetation
+        vegetation_mask = (vegetation_score > vegetation_threshold).float()
+        
+        # Apply vegetation filter: reduce building probability in vegetation areas
+        # Use 90% reduction in vegetation areas
+        reduction_factor = 0.9
+        filtered_probs = probs.squeeze(1) * (1.0 - vegetation_mask * reduction_factor)
+        
+        return filtered_probs.unsqueeze(1)
+
     def train(
         self,
         train_loader: DataLoader,
         val_loader: DataLoader,
+        scheduler,
+        optimizer,
         epochs: int,
         ckpt_dir: Path | str = "checkpoints",
         amp: bool = True,  # Automatic Mixed Precision
@@ -70,7 +129,6 @@ class DeepLabV3Trainer:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         criterion = self.loss_function()
-        scheduler = self.scheduler
         scaler = GradScaler(enabled=(amp and self.device == "cuda"))
 
         best_val = -1.0
@@ -89,7 +147,7 @@ class DeepLabV3Trainer:
                 device=self.device,
                 freeze_encoder_epochs=self.freeze_encoder_epochs,
             )
-
+            
             global_step = 0
             for ep in range(1, epochs + 1):
                 # Unfreeze encoder after warmup
@@ -107,7 +165,7 @@ class DeepLabV3Trainer:
                     leave=False,
                 )
 
-                self.optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad(set_to_none=True)
                 for bidx, (imgs, targs, keep) in enumerate(train_bar, start=1):
                     imgs = imgs.to(self.device, non_blocking=True).to(
                         memory_format=torch.channels_last
@@ -123,9 +181,9 @@ class DeepLabV3Trainer:
                         loss = criterion(logits, targs, keep)
 
                     scaler.scale(loss).backward()
-                    scaler.step(self.optimizer)
+                    scaler.step(optimizer)
                     scaler.update()
-                    self.optimizer.zero_grad(set_to_none=True)
+                    optimizer.zero_grad(set_to_none=True)
                     scheduler.step()
 
                     # EMA update after optimizer step
@@ -134,8 +192,12 @@ class DeepLabV3Trainer:
 
                     loss_sum += loss.item()
                     global_step += 1
+                    
+                    # Prevent GPU memory accumulation every 10 batches
+                    if bidx % 10 == 0 and self.device == "cuda":
+                        torch.cuda.empty_cache()
 
-                    cur_lr = self.optimizer.param_groups[0]["lr"]
+                    cur_lr = optimizer.param_groups[0]["lr"]
                     elapsed = max(1e-6, time.time() - t_start)
                     ips = n_imgs / elapsed
                     train_bar.set_postfix(
@@ -186,7 +248,9 @@ class DeepLabV3Trainer:
 
                         logits = eval_model(imgs)
                         probs = torch.sigmoid(logits)
-                        preds_bin = (probs >= 0.5).float() * keep
+                        # Apply vegetation filtering to reduce false positives
+                        filtered_probs = self.filter_vegetation_false_positives(imgs, probs)
+                        preds_bin = (filtered_probs >= 0.5).float() * keep
                         targs_eval = targs * keep
 
                         d = dice_coeff(preds_bin, targs_eval).item()
@@ -205,14 +269,17 @@ class DeepLabV3Trainer:
                 secs = max(1e-6, time.time() - t_start)
                 ips_epoch = n_imgs / secs
 
-                # Log system metrics
-                sysm = get_system_metrics(self.device)
-                mlf.log_system_metrics(sysm, step=ep)
+                
+                
+                # Force GPU memory cleanup to prevent leaks
+                if self.device == "cuda":
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
 
                 # Log training metrics
                 train_metrics = {
                     "loss": train_loss,
-                    "lr": self.optimizer.param_groups[0]["lr"],
+                    "lr": optimizer.param_groups[0]["lr"],
                     "images_per_sec": ips_epoch,
                 }
                 mlf.log_train_metrics(train_metrics, step=ep)
@@ -264,299 +331,507 @@ class DeepLabV3Trainer:
 
         return best_val
 
-    # def predict(
-    #     self,
-    #     tif_path: Path,
-    #     threshold: float,
-    #     out_dir: Path | str = "out_stream",
-    #     num_workers: int = 2,
-    #     amp: bool = True,
-    #     blocksize: int = 1024,
-    #     tmp_dir: str | None = None,
-    #     show_bar: bool = True,
-    #     predict_scales: tuple[int, ...] = (1, 2),  # << NEW
-    # ):
-    #     """
-    #     Streaming prediction for huge orthos (e.g., 40 GB) with O(tiles) memory.
-    #     Writes intermediate SUM and COUNT rasters to disk (tiled BigTIFF), updates them per-tile,
-    #     then streams a final pass to produce PROB and binary MASK GeoTIFFs.
-    #     """
-    #     tif_path = Path(tif_path)
-    #     out_dir = Path(out_dir)
-    #     out_dir.mkdir(parents=True, exist_ok=True)
+    def _clean_mask_artifacts(
+        self, 
+        mask: np.ndarray, 
+        min_object_size: int = 100,
+        morphology_kernel_size: int = 3,
+        fill_holes: bool = True,
+        show_bar: bool = True
+    ) -> np.ndarray:
+        """
+        Clean artifacts from binary mask using morphological operations and size filtering.
+        
+        Args:
+            mask: Binary mask (0/1 values)
+            min_object_size: Minimum object size in pixels
+            morphology_kernel_size: Kernel size for morphological operations
+            fill_holes: Whether to fill holes in objects
+            show_bar: Whether to show progress messages
+            
+        Returns:
+            Cleaned binary mask
+        """
+        if show_bar:
+            tqdm.write("  Cleaning mask artifacts...")
+        
+        # Ensure binary mask
+        cleaned_mask = (mask > 0).astype(np.uint8)
+        
+        # Apply morphological operations to reduce noise
+        if morphology_kernel_size > 0:
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, 
+                (morphology_kernel_size, morphology_kernel_size)
+            )
+            
+            # Opening: remove small noise (erosion followed by dilation)
+            cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+            
+            # Closing: fill small gaps (dilation followed by erosion)
+            cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        
+        # Fill holes in objects
+        if fill_holes:
+            cleaned_mask = ndimage.binary_fill_holes(cleaned_mask).astype(np.uint8)
+        
+        # Remove small objects
+        if min_object_size > 0:
+            # Find connected components
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                cleaned_mask, connectivity=8
+            )
+            
+            # Create mask for objects larger than min_object_size
+            large_objects_mask = np.zeros_like(cleaned_mask)
+            
+            # Skip background (label 0)
+            for label in range(1, num_labels):
+                area = stats[label, cv2.CC_STAT_AREA]
+                if area >= min_object_size:
+                    large_objects_mask[labels == label] = 1
+            
+            cleaned_mask = large_objects_mask
+            
+            # Count removed artifacts
+            removed_objects = num_labels - 1 - np.sum(large_objects_mask > 0)
+            if show_bar and removed_objects > 0:
+                tqdm.write(f"    Removed {removed_objects} small artifacts (< {min_object_size} pixels)")
+        
+        return cleaned_mask
 
-    #     # Dataset & loader
-    #     dataset = OrthoTileDataset(
-    #         tif_path,
-    #         tile_size=self.tile_size,
-    #         overlap=self.overlap,
-    #     )
+    def predict(
+        self,
+        tif_path: Path,
+        threshold: float,
+        out_dir: Path | str = "out_stream",
+        num_workers: int = 2,
+        amp: bool = True,
+        blocksize: int = 1024,
+        tmp_dir: str | None = None,
+        show_bar: bool = True,
+        predict_scales: tuple[int, ...] = (1, 2),  # << NEW
+        batch_size: int = 8,  # Increased default for better GPU utilization
+        # Artifact removal parameters
+        remove_artifacts: bool = True,
+        min_object_size: int = 100,  # Minimum object size in pixels
+        morphology_kernel_size: int = 3,  # Kernel size for morphological operations
+        fill_holes: bool = True,  # Fill holes in detected objects
+        # Performance parameters
+        enable_profiling: bool = False,  # Enable performance profiling
+        # Blending parameters
+        gaussian_sigma_factor: float = 0.25,  # Controls Gaussian blending sharpness (lower = crisper)
+    ):
+        """
+        Streaming prediction for huge orthos (e.g., 40 GB) with O(tiles) memory.
+        Writes intermediate SUM and COUNT rasters to disk (tiled BigTIFF), updates them per-tile,
+        then streams a final pass to produce PROB and binary MASK GeoTIFFs.
+        
+        Args:
+            tif_path: Input orthophoto path
+            threshold: Probability threshold for building detection
+            out_dir: Output directory for results
+            num_workers: Number of data loader workers
+            amp: Use automatic mixed precision
+            blocksize: Block size for tiled GeoTIFF output
+            tmp_dir: Temporary directory for intermediate files
+            show_bar: Show progress bars
+            predict_scales: Scales for multi-scale prediction
+            batch_size: Batch size for inference
+            remove_artifacts: Whether to apply artifact removal post-processing
+            min_object_size: Minimum object size in pixels to keep (removes small noise)
+            morphology_kernel_size: Kernel size for morphological operations (noise reduction)
+            fill_holes: Whether to fill holes in detected objects
+            enable_profiling: Enable performance profiling to identify bottlenecks
+            gaussian_sigma_factor: Controls Gaussian blending sharpness (0.1-0.5, lower = crisper boundaries)
+            
+        Returns:
+            Tuple of (prob_path, mask_path)
+        """
+        tif_path = Path(tif_path)
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self.tile_size = 1024
+        self.overlap = 512
+        self.batch_size = batch_size
 
-    #     loader = DataLoader(
-    #         dataset,
-    #         batch_size=self.batch_size,
-    #         shuffle=False,
-    #         num_workers=num_workers,
-    #         persistent_workers=(num_workers > 0),
-    #         prefetch_factor=2 if num_workers > 0 else None,
-    #         pin_memory=True,
-    #         collate_fn=dataset.collate_tiles,
-    #     )
+        # Dataset & loader
+        dataset = OrthoTileDataset(
+            tif_path,
+            tile_size=self.tile_size,
+            overlap=self.overlap,
+        )
 
-    #     H, W = dataset.H, dataset.W
-    #     total_tiles = len(dataset)
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            persistent_workers=(num_workers > 0),
+            prefetch_factor=4 if num_workers > 0 else None,  # Increased prefetch
+            pin_memory=True,
+            collate_fn=dataset.collate_tiles,
+        )
 
-    #     # Reference profile
-    #     ref_profile = get_file_profile(tif_path)
+        H, W = dataset.H, dataset.W
+        total_tiles = len(dataset)
 
-    #     # Create temp folder
-    #     tmp_dir = tmp_dir or tempfile.mkdtemp(prefix="footprints_tmp_")
-    #     sum_tif = Path(tmp_dir) / f"{tif_path.stem}_sum.tif"
-    #     cnt_tif = Path(tmp_dir) / f"{tif_path.stem}_cnt.tif"
+        # Reference profile
+        ref_profile = get_file_profile(tif_path)
 
-    #     # Create on-disk SUM (float32) and COUNT (uint16) rasters
-    #     sum_profile = ref_profile.copy()
-    #     sum_profile.update(
-    #         driver="GTiff",
-    #         dtype="float32",
-    #         count=1,
-    #         compress="deflate",
-    #         predictor=2,
-    #         tiled=True,
-    #         blockxsize=blocksize,
-    #         blockysize=blocksize,
-    #         BIGTIFF="YES",
-    #     )
-    #     cnt_profile = ref_profile.copy()
-    #     cnt_profile.update(
-    #         driver="GTiff",
-    #         dtype="float32",  # Changed to float32 for weight accumulation
-    #         count=1,
-    #         compress="deflate",
-    #         predictor=2,  # Use predictor=2 for float data
-    #         tiled=True,
-    #         blockxsize=blocksize,
-    #         blockysize=blocksize,
-    #         BIGTIFF="YES",
-    #     )
+        # Create temp folder
+        tmp_dir = tmp_dir or tempfile.mkdtemp(prefix="footprints_tmp_")
+        sum_tif = Path(tmp_dir) / f"{tif_path.stem}_sum.tif"
+        cnt_tif = Path(tmp_dir) / f"{tif_path.stem}_cnt.tif"
 
-    #     # Create/initialize files
-    #     with rasterio.open(sum_tif, "w", **sum_profile):
-    #         pass
-    #     with rasterio.open(cnt_tif, "w", **cnt_profile):
-    #         pass
+        # Create on-disk SUM (float32) and COUNT (uint16) rasters
+        sum_profile = ref_profile.copy()
+        sum_profile.update(
+            driver="GTiff",
+            dtype="float32",
+            count=1,
+            compress="deflate",
+            predictor=2,
+            tiled=True,
+            blockxsize=blocksize,
+            blockysize=blocksize,
+            BIGTIFF="YES",
+        )
+        cnt_profile = ref_profile.copy()
+        cnt_profile.update(
+            driver="GTiff",
+            dtype="float32",  # Changed to float32 for weight accumulation
+            count=1,
+            compress="deflate",
+            predictor=2,  # Use predictor=2 for float data
+            tiled=True,
+            blockxsize=blocksize,
+            blockysize=blocksize,
+            BIGTIFF="YES",
+        )
 
-    #     # Create weight map for smooth tile blending
-    #     if self.blending_method == "gaussian":
-    #         weight_map = create_gaussian_weight_map(self.tile_size, sigma_factor=0.3)
-    #     else:  # distance blending
-    #         weight_map = create_distance_weight_map(self.tile_size, self.border_fade)
+        # Create/initialize files
+        with rasterio.open(sum_tif, "w", **sum_profile):
+            pass
+        with rasterio.open(cnt_tif, "w", **cnt_profile):
+            pass
 
-    #     print(
-    #         f"Using {self.blending_method} blending with tile_size={self.tile_size}, overlap={self.overlap}"
-    #     )
+        # Create weight map for smooth tile blending using Gaussian for crisp boundaries
+        weight_map = create_gaussian_weight_map(self.tile_size, sigma_factor=gaussian_sigma_factor)
+        
+        if show_bar:
+            tqdm.write(f"Using Gaussian blending (σ={gaussian_sigma_factor:.2f}) with tile_size={self.tile_size}, overlap={self.overlap}")
 
-    #     # Speed/VRAM tweaks
-    #     torch.backends.cudnn.benchmark = True
-    #     self.model.eval()
-    #     # channels_last can help with NHWC kernels on Ampere+
-    #     self.model.to(memory_format=torch.channels_last)
+        # Speed/VRAM tweaks
+        torch.backends.cudnn.benchmark = True
+        self.model.eval()
+        # channels_last can help with NHWC kernels on Ampere+
+        self.model.to(memory_format=torch.channels_last)
+        
+        # Compile model for faster inference if supported
+        if hasattr(torch, 'compile') and self.device == "cuda":
+            try:
+                self.model = torch.compile(self.model, mode="max-autotune")
+                if show_bar:
+                    tqdm.write("Model compiled for faster inference")
+            except Exception as e:
+                if show_bar:
+                    tqdm.write(f"Model compilation failed, continuing without: {e}")
 
-    #     processed = 0
-    #     t0 = time.time()
-    #     iterator = (
-    #         tqdm(
-    #             loader,
-    #             total=len(loader),
-    #             unit="batch",
-    #             desc="Predict (stream)",
-    #             leave=False,
-    #         )
-    #         if show_bar
-    #         else loader
-    #     )
+        processed = 0
+        t0 = time.time()
+        iterator = (
+            tqdm(
+                loader,
+                total=len(loader),
+                unit="batch",
+                desc="Predict (stream)",
+                leave=False,
+            )
+            if show_bar
+            else loader
+        )
+        
+        # Initialize profiling
+        profiler = None
+        if enable_profiling:
+            profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                schedule=torch.profiler.schedule(wait=1, warmup=1, active=3),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True
+            )
+            profiler.start()
+            if show_bar:
+                tqdm.write("Profiling enabled - logs will be saved to ./profiler_logs")
 
-    #     # Pass 1: accumulate per tile into SUM/COUNT rasters on disk
-    #     # Open base once to avoid re-opening per tile
-    #     base_ds = rasterio.open(tif_path)
+        # Pass 1: accumulate per tile into SUM/COUNT rasters on disk
+        # Open base once to avoid re-opening per tile
+        base_ds = rasterio.open(tif_path)
 
-    #     with torch.no_grad(), autocast("cuda"):
-    #         for tiles, metas in iterator:
-    #             # We will ignore 'tiles' (full-res) and read per-scale directly from base_ds
-    #             ms_logits_sum = None  # will be torch tensor (B,1,T,T)
+        with torch.no_grad(), autocast("cuda"):
+            for batch_idx, (tiles, metas) in enumerate(iterator):
+                # We will ignore 'tiles' (full-res) and read per-scale directly from base_ds
+                ms_logits_sum = None  # will be torch tensor (B,1,T,T)
 
-    #             for scale in predict_scales:
-    #                 # Build a batch at this scale by reading windows with out_shape
-    #                 batch_list = []
-    #                 for m in metas:
-    #                     y0, x0, h, w = (
-    #                         int(m["y0"]),
-    #                         int(m["x0"]),
-    #                         int(m["h"]),
-    #                         int(m["w"]),
-    #                     )
-    #                     # scaled read (3,hs,ws)
-    #                     rgb_s, _ = read_rgb_tile_scaled(
-    #                         base_ds, x0, y0, self.tile_size, dataset.W, dataset.H, scale
-    #                     )
-    #                     rgb_s = normalize01_then_standardize(
-    #                         rgb_s, IMAGENET_MEAN, IMAGENET_STD
-    #                     )
-    #                     t = torch.from_numpy(rgb_s).unsqueeze(0)  # (1,3,hs,ws)
-    #                     t = F.interpolate(
-    #                         t,
-    #                         size=(self.tile_size, self.tile_size),
-    #                         mode="bilinear",
-    #                         align_corners=False,
-    #                     ).squeeze(0)
-    #                     batch_list.append(t)
-    #                 batch = torch.stack(batch_list, dim=0).to(
-    #                     self.device, non_blocking=True
-    #                 )  # (B,3,T,T)
-    #                 batch = batch.to(memory_format=torch.channels_last)
+                for scale in predict_scales:
+                    # Build a batch at this scale by reading windows with out_shape
+                    batch_list = []
+                    for m in metas:
+                        y0, x0, h, w = (
+                            int(m["y0"]),
+                            int(m["x0"]),
+                            int(m["h"]),
+                            int(m["w"]),
+                        )
+                        # scaled read (3,hs,ws)
+                        rgb_s, _ = read_rgb_tile_scaled(
+                            base_ds, x0, y0, self.tile_size, dataset.W, dataset.H, scale
+                        )
+                        rgb_s = normalize01_then_standardize(
+                            rgb_s, IMAGENET_MEAN, IMAGENET_STD
+                        )
+                        t = torch.from_numpy(rgb_s)  # (3,hs,ws)
+                        # Only interpolate if needed
+                        if rgb_s.shape[1] != self.tile_size or rgb_s.shape[2] != self.tile_size:
+                            t = torch.nn.functional.interpolate(
+                                t.unsqueeze(0),
+                                size=(self.tile_size, self.tile_size),
+                                mode="bilinear",
+                                align_corners=False,
+                                antialias=True  # Better quality interpolation
+                            ).squeeze(0)
+                        batch_list.append(t)
+                    batch = torch.stack(batch_list, dim=0).to(
+                        self.device, non_blocking=True
+                    )  # (B,3,T,T)
+                    batch = batch.to(memory_format=torch.channels_last)
 
-    #                 logits = self.model(batch)  # (B,1,T,T)
-    #                 ms_logits_sum = (
-    #                     logits if ms_logits_sum is None else (ms_logits_sum + logits)
-    #                 )
+                    # Mark step for CUDA graphs when using torch.compile
+                    if hasattr(torch.compiler, 'cudagraph_mark_step_begin'):
+                        torch.compiler.cudagraph_mark_step_begin()
+                    
+                    logits = self.model(batch)  # (B,1,T,T)
+                    
+                    # Clone logits to prevent CUDA graph overwrites with torch.compile
+                    logits = logits.clone()
+                    
+                    ms_logits_sum = (
+                        logits if ms_logits_sum is None else (ms_logits_sum + logits)
+                    )
 
-    #             # Average across scales, then to probs (CPU) for accumulation
-    #             logits_avg = ms_logits_sum / float(len(predict_scales))
-    #             probs = (
-    #                 torch.sigmoid(logits_avg).squeeze(1).float().cpu().numpy()
-    #             )  # (B,T,T)
+                # Average across scales, then to probs (CPU) for accumulation
+                logits_avg = ms_logits_sum / float(len(predict_scales))
+                probs = (
+                    torch.sigmoid(logits_avg).squeeze(1).float().cpu().numpy()
+                )  # (B,T,T)
+                
+                # Clean up GPU memory after batch processing
+                del ms_logits_sum, logits_avg, batch
+                if self.device == "cuda":
+                    torch.cuda.empty_cache()
 
-    #             # Update SUM/COUNT windows with weighted blending
-    #             with rasterio.open(
-    #                 sum_tif, "r+", sharing=False
-    #             ) as sum_ds, rasterio.open(cnt_tif, "r+", sharing=False) as cnt_ds:
-    #                 for p, m in zip(probs, metas):
-    #                     y0, x0, h, w = (
-    #                         int(m["y0"]),
-    #                         int(m["x0"]),
-    #                         int(m["h"]),
-    #                         int(m["w"]),
-    #                     )
-    #                     win = Window(x0, y0, w, h)
+                # Update SUM/COUNT windows with weighted blending
+                # Process batch of updates to reduce I/O operations
+                batch_updates = []
+                for p, m in zip(probs, metas):
+                    y0, x0, h, w = (
+                        int(m["y0"]),
+                        int(m["x0"]),
+                        int(m["h"]),
+                        int(m["w"]),
+                    )
+                    win = Window(x0, y0, w, h)
 
-    #                     # Apply spatial weights to tile prediction
-    #                     tile_pred = p[:h, :w].astype(np.float32)
-    #                     # TODO: Use PostProcessor
-    #                     tile_weights = weight_map[:h, :w]
-    #                     weighted_pred = apply_tile_weights(tile_pred, tile_weights)
+                    # Apply spatial weights to tile prediction
+                    tile_pred = p[:h, :w].astype(np.float32)
+                    tile_weights = weight_map[:h, :w]
+                    weighted_pred = apply_tile_weights(tile_pred, tile_weights)
+                    
+                    batch_updates.append((win, weighted_pred, tile_weights))
+                
+                # Batch write to reduce file I/O overhead
+                with rasterio.open(
+                    sum_tif, "r+", sharing=False
+                ) as sum_ds, rasterio.open(cnt_tif, "r+", sharing=False) as cnt_ds:
+                    for win, weighted_pred, tile_weights in batch_updates:
+                        # Read current accumulated values
+                        cur_sum = sum_ds.read(1, window=win)
+                        cur_cnt = cnt_ds.read(1, window=win)
 
-    #                     # Read current accumulated values
-    #                     cur_sum = sum_ds.read(1, window=win)
-    #                     cur_cnt = cnt_ds.read(1, window=win)
+                        # Accumulate weighted predictions and weights
+                        cur_sum += weighted_pred
+                        cur_cnt += tile_weights  # Accumulate weights instead of just counting
 
-    #                     # Accumulate weighted predictions and weights
-    #                     cur_sum += weighted_pred
-    #                     cur_cnt += (
-    #                         tile_weights  # Accumulate weights instead of just counting
-    #                     )
+                        # Write back
+                        sum_ds.write(cur_sum, 1, window=win)
+                        cnt_ds.write(cur_cnt, 1, window=win)
 
-    #                     # Write back
-    #                     sum_ds.write(cur_sum, 1, window=win)
-    #                     cnt_ds.write(cur_cnt, 1, window=win)
+                processed += len(metas)
+                if show_bar:
+                    elapsed = max(1e-6, time.time() - t0)
+                    iterator.set_postfix(
+                        {
+                            "tiles": f"{processed}/{total_tiles}",
+                            "t/s": f"{processed/elapsed:.2f}",
+                        }
+                    )
+                
+                # Update profiler
+                if profiler:
+                    profiler.step()
 
-    #             processed += len(metas)
-    #             if show_bar:
-    #                 elapsed = max(1e-6, time.time() - t0)
-    #                 iterator.set_postfix(
-    #                     {
-    #                         "tiles": f"{processed}/{total_tiles}",
-    #                         "t/s": f"{processed/elapsed:.2f}",
-    #                     }
-    #                 )
+        base_ds.close()
+        
+        # Stop profiler
+        if profiler:
+            profiler.stop()
+            if show_bar:
+                tqdm.write("Profiling complete - check ./profiler_logs for results")
+        
+        # Pass 2: stream SUM/COUNT -> PROB and MASK, window by window
+        prob_path = out_dir / f"{tif_path.stem}_prob.tif"
+        mask_path = out_dir / f"{tif_path.stem}_mask.tif"
 
-    #     base_ds.close()  # Pass 2: stream SUM/COUNT -> PROB and MASK, window by window
-    #     prob_path = out_dir / f"{tif_path.stem}_prob.tif"
-    #     mask_path = out_dir / f"{tif_path.stem}_mask.tif"
+        prob_profile = ref_profile.copy()
+        prob_profile.update(
+            driver="GTiff",
+            dtype="float32",
+            count=1,
+            compress="deflate",
+            predictor=2,
+            tiled=True,
+            blockxsize=blocksize,
+            blockysize=blocksize,
+            BIGTIFF="YES",
+        )
+        mask_profile = ref_profile.copy()
+        mask_profile.update(
+            driver="GTiff",
+            dtype="uint8",
+            count=1,
+            compress="deflate",
+            predictor=1,
+            tiled=True,
+            blockxsize=blocksize,
+            blockysize=blocksize,
+            BIGTIFF="YES",
+        )
 
-    #     prob_profile = ref_profile.copy()
-    #     prob_profile.update(
-    #         driver="GTiff",
-    #         dtype="float32",
-    #         count=1,
-    #         compress="deflate",
-    #         predictor=2,
-    #         tiled=True,
-    #         blockxsize=blocksize,
-    #         blockysize=blocksize,
-    #         BIGTIFF="YES",
-    #     )
-    #     mask_profile = ref_profile.copy()
-    #     mask_profile.update(
-    #         driver="GTiff",
-    #         dtype="uint8",
-    #         count=1,
-    #         compress="deflate",
-    #         predictor=1,
-    #         tiled=True,
-    #         blockxsize=blocksize,
-    #         blockysize=blocksize,
-    #         BIGTIFF="YES",
-    #     )
+        # Prepare block grid for streaming division
+        bx, by = blocksize, blocksize
+        xs = list(range(0, W, bx))
+        ys = list(range(0, H, by))
+        if xs[-1] + bx < W:
+            xs.append(W - bx)
+        if ys[-1] + by < H:
+            ys.append(H - by)
+        blocks = [(y, x) for y in ys for x in xs]
 
-    #     # Prepare block grid for streaming division
-    #     bx, by = blocksize, blocksize
-    #     xs = list(range(0, W, bx))
-    #     ys = list(range(0, H, by))
-    #     if xs[-1] + bx < W:
-    #         xs.append(W - bx)
-    #     if ys[-1] + by < H:
-    #         ys.append(H - by)
-    #     blocks = [(y, x) for y in ys for x in xs]
+        it2 = (
+            tqdm(blocks, desc="Finalize (sum/count→prob)", unit="block", leave=False)
+            if show_bar
+            else blocks
+        )
 
-    #     it2 = (
-    #         tqdm(blocks, desc="Finalize (sum/count→prob)", unit="block", leave=False)
-    #         if show_bar
-    #         else blocks
-    #     )
+        with rasterio.open(sum_tif, "r") as sum_ds, rasterio.open(
+            cnt_tif, "r"
+        ) as cnt_ds, rasterio.open(
+            prob_path, "w", **prob_profile
+        ) as prob_ds, rasterio.open(
+            mask_path, "w", **mask_profile
+        ) as mask_ds:
 
-    #     with rasterio.open(sum_tif, "r") as sum_ds, rasterio.open(
-    #         cnt_tif, "r"
-    #     ) as cnt_ds, rasterio.open(
-    #         prob_path, "w", **prob_profile
-    #     ) as prob_ds, rasterio.open(
-    #         mask_path, "w", **mask_profile
-    #     ) as mask_ds:
+            for y0, x0 in it2:
+                w = min(bx, W - x0)
+                h = min(by, H - y0)
+                win = Window(x0, y0, w, h)
 
-    #         for y0, x0 in it2:
-    #             w = min(bx, W - x0)
-    #             h = min(by, H - y0)
-    #             win = Window(x0, y0, w, h)
+                s = sum_ds.read(1, window=win).astype(np.float32)
+                c = cnt_ds.read(1, window=win).astype(np.float32)
 
-    #             s = sum_ds.read(1, window=win).astype(np.float32)
-    #             c = cnt_ds.read(1, window=win).astype(np.float32)
+                # Normalize by accumulated weights (avoid div-by-zero)
+                prob_block = np.zeros_like(s, dtype=np.float32)
+                # Use a small threshold to avoid division by very small weights
+                weight_threshold = 1e-6
+                valid_weights = c > weight_threshold
+                prob_block[valid_weights] = s[valid_weights] / c[valid_weights]
 
-    #             # Normalize by accumulated weights (avoid div-by-zero)
-    #             prob_block = np.zeros_like(s, dtype=np.float32)
-    #             # Use a small threshold to avoid division by very small weights
-    #             weight_threshold = 1e-6
-    #             valid_weights = c > weight_threshold
-    #             prob_block[valid_weights] = s[valid_weights] / c[valid_weights]
+                mask_block = (prob_block >= threshold).astype(np.uint8)
 
-    #             mask_block = (prob_block >= threshold).astype(np.uint8)
+                prob_ds.write(prob_block, 1, window=win)
+                mask_ds.write(mask_block, 1, window=win)
 
-    #             prob_ds.write(prob_block, 1, window=win)
-    #             mask_ds.write(mask_block, 1, window=win)
+        # Optional: clean up tmp files
+        try:
+            os.remove(sum_tif)
+            os.remove(cnt_tif)
+        except Exception:
+            pass
 
-    #     # Optional: clean up tmp files
-    #     try:
-    #         os.remove(sum_tif)
-    #         os.remove(cnt_tif)
-    #     except Exception:
-    #         pass
+        total_secs = time.time() - t0
+        if show_bar:
+            tqdm.write(
+                f"Streaming prediction done in {total_secs:.2f}s for {total_tiles} tiles"
+            )
 
-    #     total_secs = time.time() - t0
-    #     if show_bar:
-    #         tqdm.write(
-    #             f"Streaming prediction done in {total_secs:.2f}s for {total_tiles} tiles"
-    #         )
-
-    #     print(f"Saved:\n  Prob: {prob_path}\n  Mask: {mask_path}")
-    #     return str(prob_path), str(mask_path)
+        # Apply artifact removal post-processing if requested
+        if remove_artifacts:
+            if show_bar:
+                tqdm.write("Applying artifact removal post-processing...")
+            
+            try:
+                # Create cleaned mask path
+                cleaned_mask_path = out_dir / f"{tif_path.stem}_mask_cleaned.tif"
+                
+                # Process mask in blocks to handle large files
+                with rasterio.open(mask_path, "r") as src_mask:
+                    profile = src_mask.profile.copy()
+                    
+                    with rasterio.open(cleaned_mask_path, "w", **profile) as dst_mask:
+                        # Process in blocks
+                        for y0, x0 in it2:
+                            w = min(blocksize, W - x0)
+                            h = min(blocksize, H - y0)
+                            win = Window(x0, y0, w, h)
+                            
+                            # Read block
+                            mask_block = src_mask.read(1, window=win)
+                            
+                            # Clean artifacts in this block
+                            if np.any(mask_block > 0):  # Only process blocks with detections
+                                cleaned_block = self._clean_mask_artifacts(
+                                    mask_block,
+                                    min_object_size=min_object_size,
+                                    morphology_kernel_size=morphology_kernel_size,
+                                    fill_holes=fill_holes,
+                                    show_bar=False  # Suppress per-block messages
+                                )
+                            else:
+                                cleaned_block = mask_block
+                            
+                            # Write cleaned block
+                            dst_mask.write(cleaned_block, 1, window=win)
+                
+                if show_bar:
+                    tqdm.write("  Artifact removal complete")
+                    tqdm.write(f"  Original mask: {mask_path}")
+                    tqdm.write(f"  Cleaned mask: {cleaned_mask_path}")
+                
+                print(f"Saved:\n  Prob: {prob_path}\n  Mask: {mask_path}\n  Cleaned Mask: {cleaned_mask_path}")
+                return str(prob_path), str(mask_path), str(cleaned_mask_path)
+                
+            except Exception as e:
+                if show_bar:
+                    tqdm.write(f"Warning: Artifact removal failed: {e}")
+                print(f"Warning: Artifact removal failed: {e}")
+                print(f"Saved:\n  Prob: {prob_path}\n  Mask: {mask_path}")
+                return str(prob_path), str(mask_path)
+        else:
+            print(f"Saved:\n  Prob: {prob_path}\n  Mask: {mask_path}")
+            return str(prob_path), str(mask_path)
 
     def load_checkpoint(
         self,

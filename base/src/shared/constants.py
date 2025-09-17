@@ -1,7 +1,7 @@
 from pathlib import Path
 
 
-DATASET_DIR = Path("../SSRS/data/MOPR")
+DATASET_DIR = Path("../../SSRS/data/MOPR")
 VALIDATION_SHAHADA_ORTHO_PATH = Path("../SSRS/data/Shahada/ortho.tif")
 VALIDATION_MOPR_ORTHO_PATH = Path("../SSRS/data/MOPR/ortho_cog_cropped.tif")
 ORTHO_FILE_PATH = Path("../SSRS/data/MOPR/ortho_cog_cropped.tif")
